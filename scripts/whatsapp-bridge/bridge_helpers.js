@@ -296,6 +296,28 @@ export function appendMediaFailureNote(content, failures) {
   return content ? `${content}\n${note}` : note;
 }
 
+export async function downloadMediaWithRetry(
+  download,
+  { attempts = 3, delayMs = 350 } = {},
+) {
+  if (typeof download !== 'function') {
+    throw new TypeError('download must be a function');
+  }
+  const maxAttempts = Math.max(1, Number(attempts) || 1);
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await download();
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxAttempts && delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+      }
+    }
+  }
+  throw lastError;
+}
+
 export async function extractBridgeEvent({
   msg,
   chatId,
@@ -330,7 +352,7 @@ export async function extractBridgeEvent({
   const saveMedia = async ({ mediaMessage, dir, prefix, fallbackExt, fileName: name, type }) => {
     if (!downloadMedia) return;
     try {
-      const buf = await downloadMedia(msg);
+      const buf = await downloadMediaWithRetry(() => downloadMedia(msg));
       const ext = mediaExtForMime(mediaMessage?.mimetype, fallbackExt);
       const writer = writeMediaFile || defaultWriteMediaFile;
       const saved = await writer({ buffer: buf, dir, prefix, ext, fileName: name });

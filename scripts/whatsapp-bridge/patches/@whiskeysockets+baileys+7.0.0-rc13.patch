@@ -1,0 +1,16 @@
+diff --git a/node_modules/@whiskeysockets/baileys/lib/Utils/messages-media.js b/node_modules/@whiskeysockets/baileys/lib/Utils/messages-media.js
+index a3d2fa6..4a00bb7 100644
+--- a/node_modules/@whiskeysockets/baileys/lib/Utils/messages-media.js
++++ b/node_modules/@whiskeysockets/baileys/lib/Utils/messages-media.js
+@@ -512,6 +512,11 @@ export const downloadEncryptedContent = async (downloadUrl, { cipherKey, iv }, {
+             }
+         }
+     });
++    // Node's pipe() does not forward source errors to the destination. Undici
++    // can emit a late socket-abort error on the fetched body; without this
++    // forwarding it becomes an uncaught `error` event and terminates the whole
++    // WhatsApp bridge instead of rejecting the media download.
++    fetched.on('error', error => output.destroy(error));
+     return fetched.pipe(output, { end: true });
+ };
+ export function extensionForMediaMessage(message) {
