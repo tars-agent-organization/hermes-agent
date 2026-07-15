@@ -130,6 +130,25 @@ whatsapp:
 - `unauthorized_dm_behavior: pair` is the global default. Unknown DM senders get a pairing code.
 - `whatsapp.unauthorized_dm_behavior: ignore` makes WhatsApp stay silent for unauthorized DMs, which is usually the better choice for a private number.
 
+### Temporary conversational mode after a mention
+
+When groups require a mention, an authorized sender can optionally open a short conversational lease so immediate follow-ups do not need to repeat the bot name:
+
+```yaml
+whatsapp:
+  require_mention: true
+  mention_patterns:
+    - "^\\s*@?TARS\\b"
+  conversational_mode:
+    enabled: true
+    allowed_from:
+      - "15551234567@s.whatsapp.net"
+    idle_timeout_seconds: 300
+    max_duration_seconds: 1800
+```
+
+Only an explicit native mention or configured name pattern opens the lease. Replies to the bot and slash commands remain one-shot triggers. The lease is isolated to the same group and sender; other participants cannot reuse or extend it. Five minutes of inactivity closes it, and `max_duration_seconds` prevents an indefinitely active group. The lease owner can close it immediately with “fica quieto” or “pode parar”. Empty `allowed_from` fails closed, and restarting the gateway clears all leases.
+
 Then start the gateway:
 
 ```bash

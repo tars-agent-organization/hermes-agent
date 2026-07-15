@@ -1392,6 +1392,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             profile=event.source.profile,
         )
 
+    def _cancel_pending_conversation_batch(self, chat_id: str, sender_id: str) -> None:
+        """Drop queued text from a lease owner who has requested silence."""
+        for key, event in list(self._pending_text_batches.items()):
+            source = event.source
+            if str(source.chat_id or "") != chat_id:
+                continue
+            if not self._matches_whatsapp_allowlist(
+                str(source.user_id or ""), {sender_id}
+            ):
+                continue
+            self._pending_text_batches.pop(key, None)
+            task = self._pending_text_batch_tasks.pop(key, None)
+            if task is not None and not task.done():
+                task.cancel()
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -1881,6 +1896,9 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
+    conversational_mode = whatsapp_cfg.get("conversational_mode")
+    if isinstance(conversational_mode, dict):
+        return {"conversational_mode": conversational_mode}
     return None
 
 
