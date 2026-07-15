@@ -455,13 +455,19 @@ class TestBuildNativeContentParts:
         url = parts[1]["image_url"]["url"]
         assert url.startswith("data:image/jpeg;base64,")
 
-    def test_mime_inference_webp(self, tmp_path: Path):
-        # Real WEBP bytes (RIFF....WEBP): sniffing now wins over suffix.
-        img = tmp_path / "pic.webp"
-        img.write_bytes(b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 32)
-        parts, _ = build_native_content_parts("", [str(img)])
+    def test_webp_is_transcoded_to_png_for_provider_compatibility(self, tmp_path: Path):
+        # Codex's backend rejects valid WhatsApp sticker WEBP payloads with
+        # "image data ... does not represent a valid image". Normalize WEBP
+        # to PNG before native attachment so every supported provider sees a
+        # format it can decode consistently.
+        img = tmp_path / "sticker.webp"
+        img.write_bytes(base64.b64decode(
+            "UklGRhwAAABXRUJQVlA4TA8AAAAvAAAAAAcQ/Y/+ByKi/wEA"
+        ))
+        parts, skipped = build_native_content_parts("", [str(img)])
+        assert skipped == []
         url = parts[1]["image_url"]["url"]
-        assert url.startswith("data:image/webp;base64,")
+        assert url.startswith("data:image/png;base64,")
 
     def test_mime_sniff_overrides_misleading_extension(self, tmp_path: Path):
         """Discord-style bug: file is named .webp but contains PNG bytes.
