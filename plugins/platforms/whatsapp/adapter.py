@@ -943,6 +943,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] WhatsApp read receipt failed: %s", self.name, exc)
 
+    def _cancel_pending_conversation_batch(self, chat_id: str, sender_id: str) -> None:
+        """Drop queued text from a lease owner who requested silence."""
+        for key, event in list(self._pending_text_batches.items()):
+            source = event.source
+            if str(source.chat_id or "") != chat_id:
+                continue
+            if not self._matches_whatsapp_allowlist(str(source.user_id or ""), {sender_id}):
+                continue
+            self._pending_text_batches.pop(key, None)
+            task = self._pending_text_batch_tasks.pop(key, None)
+            if task is not None and not task.done():
+                task.cancel()
+
     _SPLIT_THRESHOLD = 6000  # WhatsApp supports ~65K chars; generous threshold
 
     @staticmethod
@@ -1221,7 +1234,11 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
 def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
     """``apply_yaml_config_fn`` (#24849): config.yaml whatsapp: keys → WHATSAPP_* env (env wins; skipped under
     a multiplexed secondary profile's scope, #80099) + ``PlatformConfig.extra`` (extra-first readers)."""
-    return _apply_yaml_bridge(whatsapp_cfg, _YAML_BRIDGE)
+    seeded = _apply_yaml_bridge(whatsapp_cfg, _YAML_BRIDGE) or {}
+    conversational_mode = whatsapp_cfg.get("conversational_mode")
+    if isinstance(conversational_mode, dict):
+        seeded["conversational_mode"] = conversational_mode
+    return seeded or None
 
 
 

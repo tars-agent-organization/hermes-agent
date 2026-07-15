@@ -5,7 +5,8 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
-                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None):
+                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None,
+                  conversational_mode=None):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     extra = {}
@@ -23,6 +24,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["group_policy"] = group_policy
     if group_allow_from is not None:
         extra["group_allow_from"] = group_allow_from
+    if conversational_mode is not None:
+        extra["conversational_mode"] = conversational_mode
 
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
@@ -34,6 +37,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
     adapter._group_allow_from = WhatsAppAdapter._coerce_allow_list(extra.get("group_allow_from"))
     adapter._mention_patterns = adapter._compile_mention_patterns()
     adapter._free_response_chats = adapter._whatsapp_free_response_chats()
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
     return adapter
 
 
@@ -42,6 +47,8 @@ def _group_message(body="hello", **overrides):
         "isGroup": True,
         "body": body,
         "chatId": "120363001234567890@g.us",
+        "senderId": "6281234567890@s.whatsapp.net",
+        "from": "6281234567890@s.whatsapp.net",
         "mentionedIds": [],
         "botIds": ["15551230000@s.whatsapp.net", "15551230000@lid"],
         "quotedParticipant": "",
@@ -106,6 +113,85 @@ def test_invalid_regex_patterns_are_ignored():
 
     assert adapter._should_process_message(_group_message("chompy status")) is True
     assert adapter._should_process_message(_group_message("hello everyone")) is False
+
+
+def _conversation_mode(**overrides):
+    config = {
+        "enabled": True,
+        "allowed_from": ["6281234567890@s.whatsapp.net"],
+        "idle_timeout_seconds": 300,
+        "max_duration_seconds": 1800,
+    }
+    config.update(overrides)
+    return config
+
+
+def _conversation_adapter():
+    return _make_adapter(
+        require_mention=True,
+        mention_patterns=[r"^\s*@?tars\b"],
+        group_policy="open",
+        conversational_mode=_conversation_mode(),
+    )
+
+
+def test_explicit_name_mention_opens_temporary_conversation():
+    adapter = _conversation_adapter()
+    assert adapter._should_process_message(_group_message("Tars, olha isso")) is True
+    assert adapter._should_process_message(_group_message("continuação sem menção")) is True
+
+
+def test_conversation_lease_is_bound_to_sender_and_group():
+    adapter = _conversation_adapter()
+    adapter._should_process_message(_group_message("Tars, olha isso"))
+    other = {"senderId": "6289999999999@s.whatsapp.net", "from": "6289999999999@s.whatsapp.net"}
+    assert adapter._should_process_message(_group_message("outro participante", **other)) is False
+    assert adapter._should_process_message(_group_message("outro grupo", chatId="999999999999@g.us")) is False
+    assert adapter._should_process_message(_group_message("continuação do dono")) is True
+
+
+def test_silence_request_closes_lease_and_is_consumed():
+    adapter = _conversation_adapter()
+    adapter._should_process_message(_group_message("Tars, olha isso"))
+    assert adapter._should_process_message(_group_message("fica quieto")) is False
+    assert adapter._should_process_message(_group_message("não deve passar")) is False
+
+
+def test_other_participant_cannot_close_lease():
+    adapter = _conversation_adapter()
+    adapter._should_process_message(_group_message("Tars, olha isso"))
+    other = {"senderId": "6289999999999@s.whatsapp.net", "from": "6289999999999@s.whatsapp.net"}
+    assert adapter._should_process_message(_group_message("fica quieto", **other)) is False
+    assert adapter._should_process_message(_group_message("ainda ativo")) is True
+
+
+def test_conversation_lease_expiration_limits():
+    adapter = _conversation_adapter()
+    adapter._should_process_message(_group_message("Tars, olha isso"))
+    lease = adapter._conversation_lease_map()["120363001234567890@g.us"]
+    lease.last_activity_at -= 301
+    assert adapter._should_process_message(_group_message("tarde demais")) is False
+
+    adapter._should_process_message(_group_message("Tars, reabre"))
+    lease = adapter._conversation_lease_map()["120363001234567890@g.us"]
+    lease.opened_at -= 1801
+    assert adapter._should_process_message(_group_message("sessão longa demais")) is False
+
+
+def test_reply_and_slash_command_do_not_open_conversation_lease():
+    adapter = _conversation_adapter()
+    assert adapter._should_process_message(
+        _group_message("respondendo", quotedParticipant="15551230000@lid")) is True
+    assert adapter._should_process_message(_group_message("seguinte")) is False
+    assert adapter._should_process_message(_group_message("/status")) is True
+    assert adapter._should_process_message(_group_message("seguinte")) is False
+
+
+def test_unlisted_sender_cannot_open_conversation_lease():
+    adapter = _conversation_adapter()
+    other = {"senderId": "6289999999999@s.whatsapp.net", "from": "6289999999999@s.whatsapp.net"}
+    assert adapter._should_process_message(_group_message("Tars, oi", **other)) is True
+    assert adapter._should_process_message(_group_message("continuação", **other)) is False
 
 
 def test_free_response_chats_bypass_mention_gating():
@@ -195,6 +281,27 @@ def test_config_bridges_whatsapp_dm_and_group_policy(monkeypatch, tmp_path):
     assert __import__("os").environ["WHATSAPP_DM_POLICY"] == "disabled"
     assert __import__("os").environ["WHATSAPP_GROUP_POLICY"] == "allowlist"
     assert __import__("os").environ["WHATSAPP_GROUP_ALLOWED_USERS"] == "120363001234567890@g.us"
+
+
+def test_config_bridges_whatsapp_conversational_mode(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "whatsapp:\n"
+        "  require_mention: true\n"
+        "  conversational_mode:\n"
+        "    enabled: true\n"
+        "    allowed_from:\n"
+        "      - owner@lid\n"
+        "    idle_timeout_seconds: 300\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = load_gateway_config()
+    mode = config.platforms[Platform.WHATSAPP].extra["conversational_mode"]
+    assert mode["enabled"] is True
+    assert mode["allowed_from"] == ["owner@lid"]
+    assert mode["idle_timeout_seconds"] == 300
 
 
 # --- Broadcast / status / newsletter pseudo-chats are always dropped ---

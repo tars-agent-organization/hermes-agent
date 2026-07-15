@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -28,6 +30,13 @@ from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
 logger = logging.getLogger(__name__)
 
 _TRUTHY = {"true", "1", "yes", "on"}
+
+
+@dataclass
+class _ConversationLease:
+    sender_id: str
+    opened_at: float
+    last_activity_at: float
 
 
 def _stash(pattern: str, text: str, tag: str) -> tuple[str, list[str]]:
@@ -99,6 +108,84 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         """``extra.free_response_chats`` (blank = unset) else the scoped env CSV."""
         return self._coerce_allow_list(
             _extra_or_wsecret(self.config.extra, "free_response_chats", "WHATSAPP_FREE_RESPONSE_CHATS"))
+
+    def _whatsapp_conversational_mode(self) -> dict[str, Any]:
+        raw = self.config.extra.get("conversational_mode")
+        return raw if isinstance(raw, dict) else {}
+
+    def _conversation_mode_enabled(self) -> bool:
+        value = self._whatsapp_conversational_mode().get("enabled", False)
+        return value.strip().lower() in _TRUTHY if isinstance(value, str) else bool(value)
+
+    def _conversation_mode_timeout(self, key: str, default: float, minimum: float, maximum: float) -> float:
+        import math
+
+        try:
+            parsed = float(self._whatsapp_conversational_mode().get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return parsed if math.isfinite(parsed) and minimum <= parsed <= maximum else default
+
+    def _conversation_idle_timeout(self) -> float:
+        return self._conversation_mode_timeout("idle_timeout_seconds", 300.0, 15.0, 900.0)
+
+    def _conversation_max_duration(self) -> float:
+        duration = self._conversation_mode_timeout("max_duration_seconds", 1800.0, 60.0, 3600.0)
+        return max(duration, self._conversation_idle_timeout())
+
+    def _conversation_allowed_from(self) -> set[str]:
+        return self._coerce_allow_list(self._whatsapp_conversational_mode().get("allowed_from"))
+
+    def _conversation_close_patterns(self) -> list[re.Pattern]:
+        configured = self._whatsapp_conversational_mode().get("close_patterns")
+        if configured is None:
+            configured = [
+                r"^\s*(?:@?tars[\s,:-]+)?(?:fica|fique)\s+quieto(?:\s+de\s+novo)?[.!]?\s*$",
+                r"^\s*(?:@?tars[\s,:-]+)?pode\s+parar[.!]?\s*$",
+            ]
+        if isinstance(configured, str):
+            configured = [configured]
+        if not isinstance(configured, list):
+            return []
+        compiled: list[re.Pattern] = []
+        for pattern in configured:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            try:
+                compiled.append(re.compile(pattern, re.IGNORECASE))
+            except re.error:
+                logger.warning("[%s] Invalid WhatsApp conversational close pattern %r", self.name, pattern)
+        return compiled
+
+    def _conversation_lease_map(self) -> dict[str, _ConversationLease]:
+        leases = getattr(self, "_conversation_leases", None)
+        if not isinstance(leases, dict):
+            leases = {}
+            self._conversation_leases = leases
+        return leases
+
+    def _active_conversation_lease(self, chat_id: str, *, now: Optional[float] = None) -> Optional[_ConversationLease]:
+        leases = self._conversation_lease_map()
+        lease = leases.get(chat_id)
+        if lease is None:
+            return None
+        current = time.monotonic() if now is None else now
+        if current - lease.last_activity_at >= self._conversation_idle_timeout() or current - lease.opened_at >= self._conversation_max_duration():
+            leases.pop(chat_id, None)
+            return None
+        return lease
+
+    def _message_closes_conversation(self, data: Dict[str, Any]) -> bool:
+        body = str(data.get("body") or "")
+        return any(pattern.search(body) for pattern in self._conversation_close_patterns())
+
+    def _cancel_pending_conversation_batch(self, chat_id: str, sender_id: str) -> None:
+        """Optional transport hook invoked when the lease owner requests silence."""
+
+    def _open_conversation_lease(self, chat_id: str, sender_id: str, *, now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else now
+        self._conversation_lease_map()[chat_id] = _ConversationLease(
+            sender_id=sender_id, opened_at=current, last_activity_at=current)
 
     @staticmethod
     def _coerce_allow_list(raw) -> set[str]:
@@ -254,15 +341,29 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
             return self._is_dm_intake_allowed(str(data.get("senderId") or data.get("from") or ""))
         if not self._is_group_allowed(chat_id):
             return False
-        # Group messages: check mention / free-response settings
+        # Group messages: check mention / free-response settings.
+        sender_id = self._normalize_whatsapp_id(data.get("senderId") or data.get("from"))
+        conversational_mode = self._conversation_mode_enabled()
+        lease = self._active_conversation_lease(chat_id) if conversational_mode and sender_id else None
+        if lease is not None and lease.sender_id == sender_id and self._message_closes_conversation(data):
+            self._conversation_lease_map().pop(chat_id, None)
+            self._cancel_pending_conversation_batch(chat_id, sender_id)
+            return False
         if chat_id in self._whatsapp_free_response_chats() or not self._whatsapp_require_mention():
             return True
-        return (
-            str(data.get("body") or "").strip().startswith("/")
-            or self._message_is_reply_to_bot(data)
-            or self._message_mentions_bot(data)
-            or self._message_matches_mention_patterns(data)
-        )
+        if str(data.get("body") or "").strip().startswith("/") or self._message_is_reply_to_bot(data):
+            return True
+        explicitly_called = self._message_mentions_bot(data) or self._message_matches_mention_patterns(data)
+        if explicitly_called:
+            if conversational_mode and sender_id and self._matches_whatsapp_allowlist(
+                sender_id, self._conversation_allowed_from()
+            ):
+                self._open_conversation_lease(chat_id, sender_id)
+            return True
+        if lease is not None and lease.sender_id == sender_id:
+            lease.last_activity_at = time.monotonic()
+            return True
+        return False
 
     # ------------------------------------------------------------------ formatting
     def format_message(self, content: str) -> str:

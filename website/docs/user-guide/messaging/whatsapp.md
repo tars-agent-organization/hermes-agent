@@ -193,6 +193,25 @@ needs the participant paired or `WHATSAPP_ALLOW_ALL_USERS=true`. By default the 
 message; set `require_mention: true` / `WHATSAPP_REQUIRE_MENTION=true` to answer only @mentions, replies to the
 bot, or `/commands` (groups in `free_response_chats` are exempt).
 
+When groups require a mention, an authorized sender can optionally open a short
+conversation window so immediate follow-ups do not need to repeat the bot name:
+
+```yaml
+whatsapp:
+  require_mention: true
+  conversational_mode:
+    enabled: true
+    allowed_from: ["15551234567"]
+    idle_timeout_seconds: 300
+    max_duration_seconds: 1800
+```
+
+Only an explicit mention or configured name pattern opens the window. Replies
+and slash commands remain one-shot triggers. The window is isolated to the same
+group and sender, expires after inactivity or the absolute duration, and can be
+closed immediately with “fica quieto” or “pode parar”. An empty `allowed_from`
+fails closed, and restarting the gateway clears all windows.
+
 Then start the gateway:
 
 ```bash
