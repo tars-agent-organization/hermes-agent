@@ -312,6 +312,15 @@ class TestBuildNativeContentParts:
         assert str(img1) in text_part["text"]
         assert str(img2) in text_part["text"]
 
+    def test_webp_is_transcoded_to_png_for_provider_compatibility(self, tmp_path: Path):
+        img = tmp_path / "sticker.webp"
+        img.write_bytes(base64.b64decode(
+            "UklGRhwAAABXRUJQVlA4TA8AAAAvAAAAAAcQ/Y/+ByKi/wEA"
+        ))
+        parts, skipped = build_native_content_parts("", [str(img)])
+        assert skipped == []
+        assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
 
 
 

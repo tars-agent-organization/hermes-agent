@@ -27,9 +27,10 @@ _EXTENSION_MIME_TYPES = {
     ".svg": "image/svg+xml",
 }
 
-# Media types the major vision providers (Anthropic in particular) accept
-# inline. SVG/BMP/TIFF are rejected with a non-retryable 400.
-_ANTHROPIC_SUPPORTED_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+# Media types accepted consistently by every provider path. WEBP is decoded
+# locally and re-encoded as PNG because the Codex backend rejects some valid
+# WhatsApp sticker containers.
+_ANTHROPIC_SUPPORTED_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
 
 
 def unsupported_inline_image_media_type(url: str) -> Optional[str]:
@@ -186,7 +187,7 @@ def _normalize_to_supported_image(
     """Ensure an image is in a provider-supported format. Returns ``(path, mime, error)``: the input
     unchanged when supported; ``(new_png_path, "image/png", None)`` after conversion — a temp file
     the CALLER must clean up; ``(None, None, message)`` when impossible. SVG is rasterized; other
-    Pillow-readable rasters (BMP, TIFF) re-encode to PNG."""
+    Pillow-readable rasters (BMP, TIFF, WEBP) re-encode to PNG."""
     if detected_mime in _supported_media_types():
         return image_path, detected_mime, None
     from tools.vision_tools import _secure_cache_dir

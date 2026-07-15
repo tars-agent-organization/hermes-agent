@@ -428,11 +428,10 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     return "image/svg+xml" if head.startswith((b"<?xml", b"<svg")) and b"<svg" in head else None
 
 
-# Formats every major vision provider accepts natively. Anything else is transcoded
-# to PNG before declaring media_type or the provider returns HTTP 400 and the turn
-# fails; chat platforms freely accept AVIF (Chromium screenshots), HEIC (iPhone),
-# TIFF, BMP and ICO. SVG is vector — Pillow cannot rasterize it — so it is skipped.
-_UNIVERSALLY_SUPPORTED_MIMES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+# Formats accepted consistently by every native-image path. Although several
+# public APIs accept WEBP, the Codex backend rejects valid WhatsApp sticker
+# payloads, so WEBP is normalized to PNG before it enters conversation history.
+_UNIVERSALLY_SUPPORTED_MIMES = frozenset({"image/png", "image/jpeg", "image/gif"})
 
 
 def _transcode_to_png(raw: bytes) -> Optional[bytes]:

@@ -326,6 +326,7 @@ _MEDIA_NEEDLES = (("image", MessageType.PHOTO), ("video", MessageType.VIDEO), ("
 _MEDIA_INFO = {
     MessageType.PHOTO: ("image", "image/jpeg"), MessageType.VOICE: ("audio", "audio/ogg"), MessageType.AUDIO: ("audio", "audio/mpeg"),
     MessageType.VIDEO: ("video", "video/mp4"), MessageType.DOCUMENT: ("document", ""),
+    MessageType.STICKER: ("sticker", "image/webp"),
 }
 _MEDIA_TYPE_BY_BRIDGE_KIND = {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.VOICE, "document": MessageType.DOCUMENT}
 _QUOTED_MIME_BY_BRIDGE_KIND = {
@@ -960,8 +961,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         bridge_mime = str(data.get("mime") or "").strip()
         for url in data.get("mediaUrls", []):
             mime = bridge_mime or (SUPPORTED_DOCUMENT_TYPES.get(Path(url).suffix.lower(), "application/octet-stream") if msg_type == MessageType.DOCUMENT else default_mime)
-            if url.startswith(("http://", "https://")) and msg_type in {MessageType.PHOTO, MessageType.VOICE, MessageType.AUDIO}:
-                cacher, ext = (cache_image_from_url, ".jpg") if msg_type == MessageType.PHOTO else (cache_audio_from_url, ".ogg")
+            if url.startswith(("http://", "https://")) and msg_type in {MessageType.PHOTO, MessageType.STICKER, MessageType.VOICE, MessageType.AUDIO}:
+                if msg_type in {MessageType.PHOTO, MessageType.STICKER}:
+                    cacher, ext = cache_image_from_url, ".webp" if msg_type == MessageType.STICKER else ".jpg"
+                else:
+                    cacher, ext = cache_audio_from_url, ".ogg"
                 try:
                     url = await cacher(url, ext=ext)
                     print(f"[{self.name}] Cached user {label}: {url}", flush=True)
