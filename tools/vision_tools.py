@@ -332,12 +332,21 @@ def _normalize_to_supported_image(
         path is a temp file the CALLER must clean up.
       - If conversion is impossible: ``(None, None, <error message>)``.
 
+    WEBP is always re-encoded to PNG. Some WhatsApp stickers contain RIFF/VP8X
+    combinations accepted by tolerant local decoders but rejected by stricter
+    provider decoders. Re-encoding validates the payload and strips inconsistent
+    chunks before the image enters immutable conversation history.
+
     SVG is rasterized to PNG (best-effort, soft deps).  Other raster formats
-    Pillow can read (BMP, TIFF, etc.) are re-encoded to PNG.  This runs BEFORE
+    Pillow can read (BMP, TIFF, WEBP, etc.) are re-encoded to PNG.  This runs BEFORE
     the image is base64-embedded into conversation history, so an unsupported
-    media_type can never reach the provider and wedge the session.
+    or provider-incompatible media_type can never reach the provider and wedge
+    the session.
     """
-    if detected_mime in _ANTHROPIC_SUPPORTED_MEDIA_TYPES:
+    if (
+        detected_mime in _ANTHROPIC_SUPPORTED_MEDIA_TYPES
+        and detected_mime != "image/webp"
+    ):
         return image_path, detected_mime, None
 
     out_dir = get_hermes_dir("cache/vision", "temp_vision_images")

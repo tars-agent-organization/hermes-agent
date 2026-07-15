@@ -855,6 +855,24 @@ class TestDownloadRetryClassification:
         assert mock_sleep.await_count == 2
 
 
+class TestWebpNormalization:
+    def test_webp_is_reencoded_to_png_before_vision_provider(self, tmp_path):
+        from tools.vision_tools import _normalize_to_supported_image
+
+        webp = tmp_path / "sticker.webp"
+        webp.write_bytes(base64.b64decode(
+            "UklGRhwAAABXRUJQVlA4TA8AAAAvAAAAAAcQ/Y/+ByKi/wEA"
+        ))
+
+        normalized, mime, error = _normalize_to_supported_image(webp, "image/webp")
+        assert error is None
+        assert normalized is not None
+        assert mime == "image/png"
+        assert normalized != webp
+        assert normalized.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        normalized.unlink()
+
+
 # ---------------------------------------------------------------------------
 # CPU-burst concurrency cap — a single turn (or several concurrent sessions in
 # one process) can launch dozens of vision_analyze calls at once. Only the

@@ -583,8 +583,11 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
 # iPhones, TIFF from scanners, BMP from old Windows tools, ICO -- so users
 # do hit this in practice. SVG is vector and Pillow cannot rasterize it;
 # it is skipped (logged) rather than transcoded.
+# Formats accepted consistently by all native-image provider paths. Although
+# several public APIs accept WEBP, the Codex backend rejects valid WhatsApp
+# sticker WEBP payloads as invalid image data. Normalize WEBP to PNG below.
 _UNIVERSALLY_SUPPORTED_MIMES = frozenset({
-    "image/png", "image/jpeg", "image/gif", "image/webp",
+    "image/png", "image/jpeg", "image/gif",
 })
 
 

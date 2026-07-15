@@ -235,9 +235,19 @@ class TestBuildNativeContentParts:
         assert str(img1) in text_part["text"]
         assert str(img2) in text_part["text"]
 
-
-
-
+    def test_webp_is_transcoded_to_png_for_provider_compatibility(self, tmp_path: Path):
+        # Codex's backend rejects valid WhatsApp sticker WEBP payloads with
+        # "image data ... does not represent a valid image". Normalize WEBP
+        # to PNG before native attachment so every supported provider sees a
+        # format it can decode consistently.
+        img = tmp_path / "sticker.webp"
+        img.write_bytes(base64.b64decode(
+            "UklGRhwAAABXRUJQVlA4TA8AAAAvAAAAAAcQ/Y/+ByKi/wEA"
+        ))
+        parts, skipped = build_native_content_parts("", [str(img)])
+        assert skipped == []
+        url = parts[1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
 
 # ─── Oversize handling ───────────────────────────────────────────────────────
 

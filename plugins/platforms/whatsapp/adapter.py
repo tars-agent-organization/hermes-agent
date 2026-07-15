@@ -1484,7 +1484,24 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             media_types = []
             for url in raw_urls:
                 bridge_mime = str(data.get("mime") or "").strip()
-                if msg_type == MessageType.PHOTO and url.startswith(("http://", "https://")):
+                if msg_type == MessageType.STICKER and url.startswith(("http://", "https://")):
+                    try:
+                        cached_path = await cache_image_from_url(url, ext=".webp")
+                        cached_urls.append(cached_path)
+                        media_types.append(bridge_mime or "image/webp")
+                        print(f"[{self.name}] Cached user sticker: {cached_path}", flush=True)
+                    except Exception as e:
+                        print(f"[{self.name}] Failed to cache sticker: {e}", flush=True)
+                        cached_urls.append(url)
+                        media_types.append(bridge_mime or "image/webp")
+                elif msg_type == MessageType.STICKER and os.path.isabs(url):
+                    if _is_allowed_bridge_path(url):
+                        cached_urls.append(url)
+                        media_types.append(bridge_mime or "image/webp")
+                        print(f"[{self.name}] Using bridge-cached sticker: {url}", flush=True)
+                    else:
+                        print(f"[{self.name}] Rejected bridge sticker path outside cache dir: {url}", flush=True)
+                elif msg_type == MessageType.PHOTO and url.startswith(("http://", "https://")):
                     try:
                         cached_path = await cache_image_from_url(url, ext=".jpg")
                         cached_urls.append(cached_path)
