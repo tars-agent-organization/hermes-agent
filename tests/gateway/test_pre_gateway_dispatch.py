@@ -13,6 +13,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from gateway.session_context import get_trusted_request_metadata
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -72,7 +73,13 @@ async def test_internal_events_bypass_hook(monkeypatch):
         called["count"] += 1
         return [{"action": "skip"}]
 
-    async def _capture(event, source, _quick_key, _run_generation):
+    async def _capture(
+        event,
+        source,
+        _quick_key,
+        _run_generation,
+        trusted_request_metadata=None,
+    ):
         return "ok"
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
@@ -117,4 +124,35 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     assert result is None
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pre_hook_and_unauthorized_dispatch_never_bind_trusted_metadata(
+    monkeypatch,
+):
+    _clear_auth_env(monkeypatch)
+    observed = []
+
+    def hook(name, **_kwargs):
+        if name == "pre_gateway_dispatch":
+            observed.append(("hook", get_trusted_request_metadata()))
+        return [{"action": "allow"}]
+
+    def authorize(_source):
+        observed.append(("auth", get_trusted_request_metadata()))
+        return False
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = authorize
+    event = _make_event()
+    event.source.chat_type = "group"
+    event.metadata = {"adapter_signal": True}
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    assert observed == [("hook", None), ("auth", None)]
+    assert get_trusted_request_metadata() is None
     adapter.send.assert_not_awaited()

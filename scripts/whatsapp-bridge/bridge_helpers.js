@@ -468,6 +468,7 @@ export async function extractBridgeEvent({
     senderName: msg.pushName || senderNumber,
     chatName: isGroup ? (chatId.split('@')[0]) : (msg.pushName || senderNumber),
     isGroup,
+    isForwarded: contextInfo?.isForwarded === true,
     body,
     hasMedia,
     mediaType,

@@ -7,6 +7,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session_context import get_trusted_request_metadata
 
 
 def _make_source() -> SessionSource:
@@ -108,7 +109,13 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
     runner, _adapter = _make_runner()
     captured = {}
 
-    async def fake_handle_message_with_agent(event, source, key, generation):
+    async def fake_handle_message_with_agent(
+        event,
+        source,
+        key,
+        generation,
+        trusted_request_metadata=None,
+    ):
         captured["text"] = event.text
         captured["command"] = event.get_command()
         captured["source"] = source
@@ -127,5 +134,62 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
     assert captured["key"] == build_session_key(_make_source())
     assert captured["generation"] == 1
     assert runner._running_agents == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relayed", [False, True])
+async def test_dispatch_captures_trusted_metadata_before_hook_and_passes_after_auth(
+    monkeypatch,
+    relayed,
+):
+    runner, _adapter = _make_runner()
+    event = _make_event("ordinary message")
+    event.internal = False
+    event.source.delivered_via_upstream_relay = relayed
+    event.metadata = {
+        "adapter_signal": {"state": "original"},
+        "hermes_relayed": not relayed,
+        "hermes_ingress_direct": relayed,
+    }
+    lifecycle_observations = []
+    captured = {}
+
+    def hook(_name, **kwargs):
+        lifecycle_observations.append(
+            ("hook", get_trusted_request_metadata())
+        )
+        kwargs["event"].metadata["adapter_signal"]["state"] = "hook-mutated"
+        kwargs["event"].metadata["hook_only"] = True
+        return [{"action": "allow"}]
+
+    def authorize(_source):
+        lifecycle_observations.append(
+            ("auth", get_trusted_request_metadata())
+        )
+        return True
+
+    async def handle_with_agent(
+        _event,
+        _source,
+        _key,
+        _generation,
+        trusted_request_metadata=None,
+    ):
+        captured["metadata"] = trusted_request_metadata
+        return "handled"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+    runner._is_user_authorized = authorize
+    runner._handle_message_with_agent = handle_with_agent
+
+    result = await runner._handle_message(event)
+
+    assert result == "handled"
+    assert lifecycle_observations == [("hook", None), ("auth", None)]
+    assert captured["metadata"]["adapter_signal"] == {"state": "original"}
+    assert "hook_only" not in captured["metadata"]
+    assert captured["metadata"]["hermes_relayed"] is relayed
+    assert captured["metadata"]["hermes_ingress_direct"] is (not relayed)
+    assert get_trusted_request_metadata() is None
 
 

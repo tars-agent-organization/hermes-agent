@@ -1408,6 +1408,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         else:
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            # A debounced batch represents every fragment.  Preserve the
+            # security-relevant bridge marker with a strict boolean OR so a
+            # normal first fragment cannot hide a later forwarded fragment.
+            existing.metadata["whatsapp_forwarded"] = (
+                existing.metadata.get("whatsapp_forwarded") is True
+                or event.metadata.get("whatsapp_forwarded") is True
+            )
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
@@ -1601,7 +1608,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
-            metadata: Dict[str, Any] = {}
+            # ``isForwarded`` is a bridge-owned projection of Baileys'
+            # ``contextInfo.isForwarded === true``.  Keep the adapter boundary
+            # strict as well: malformed or truthy JSON values must never become
+            # trusted forwarding provenance, and user-authored body text is not
+            # consulted.
+            metadata: Dict[str, Any] = {
+                "whatsapp_forwarded": data.get("isForwarded") is True,
+            }
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:

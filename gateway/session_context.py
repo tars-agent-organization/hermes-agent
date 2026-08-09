@@ -36,8 +36,10 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from types import MappingProxyType
 from typing import Any, Iterator
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -121,6 +123,13 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Trusted adapter metadata is deliberately in-process only. It is not part of
+# ``_VAR_MAP`` and therefore cannot be resolved from or exported to the process
+# environment.
+_TRUSTED_REQUEST_METADATA: ContextVar = ContextVar(
+    "hermes_trusted_request_metadata", default=None
+)
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -203,6 +212,48 @@ def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
         _SESSION_ID.set(previous)
 
 
+def _freeze_trusted_metadata_value(value: Any, active_ids: set[int]) -> Any:
+    """Recursively copy supported metadata into immutable containers."""
+    if type(value) in (str, bytes, int, float, bool, type(None)):
+        return value
+
+    if not isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        raise TypeError("unsupported trusted metadata value")
+
+    marker = id(value)
+    if marker in active_ids:
+        raise ValueError("cyclic trusted metadata")
+    active_ids.add(marker)
+    try:
+        if isinstance(value, Mapping):
+            frozen = {
+                _freeze_trusted_metadata_value(key, active_ids):
+                _freeze_trusted_metadata_value(item, active_ids)
+                for key, item in value.items()
+            }
+            return MappingProxyType(frozen)
+        if isinstance(value, (list, tuple)):
+            return tuple(
+                _freeze_trusted_metadata_value(item, active_ids) for item in value
+            )
+        return frozenset(
+            _freeze_trusted_metadata_value(item, active_ids) for item in value
+        )
+    finally:
+        active_ids.remove(marker)
+
+
+def _snapshot_trusted_request_metadata(metadata: Any) -> Mapping | None:
+    """Return a detached immutable metadata mapping, failing closed."""
+    if metadata is None or not isinstance(metadata, Mapping):
+        return None
+    try:
+        snapshot = _freeze_trusted_metadata_value(metadata, set())
+    except Exception:
+        return None
+    return snapshot if isinstance(snapshot, Mapping) else None
+
+
 def set_session_vars(
     platform: str = "",
     source: str = "",
@@ -220,6 +271,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    trusted_request_metadata: Any = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -239,6 +291,10 @@ def set_session_vars(
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
+
+    ``trusted_request_metadata`` is copied into recursively immutable,
+    request-local storage. Unsupported values and cycles fail closed to
+    ``None``; the value is never bridged through ``os.environ``.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -262,6 +318,9 @@ def set_session_vars(
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
+    _TRUSTED_REQUEST_METADATA.set(
+        _snapshot_trusted_request_metadata(trusted_request_metadata)
+    )
     try:
         from agent.runtime_cwd import set_session_cwd
 
@@ -304,6 +363,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _TRUSTED_REQUEST_METADATA.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -352,6 +412,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _TRUSTED_REQUEST_METADATA.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -384,6 +445,11 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_trusted_request_metadata() -> Mapping | None:
+    """Return trusted request-local adapter metadata, if a request is bound."""
+    return _TRUSTED_REQUEST_METADATA.get()
 
 
 # Surfaces that are not a human chat channel. The gateway binds a platform

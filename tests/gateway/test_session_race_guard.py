@@ -90,7 +90,9 @@ async def test_sentinel_placed_before_agent_setup():
     # Patch _handle_message_with_agent to capture state at entry
     sentinel_was_set = False
 
-    async def mock_inner(self_inner, ev, src, qk, generation):
+    async def mock_inner(
+        self_inner, ev, src, qk, generation, trusted_request_metadata=None
+    ):
         nonlocal sentinel_was_set
         sentinel_was_set = runner._running_agents.get(qk) is _AGENT_PENDING_SENTINEL
         return "ok"
@@ -242,7 +244,9 @@ async def test_stop_during_sentinel_force_cleans_session():
 
     barrier = asyncio.Event()
 
-    async def slow_inner(self_inner, ev, src, qk, generation):
+    async def slow_inner(
+        self_inner, ev, src, qk, generation, trusted_request_metadata=None
+    ):
         await barrier.wait()
         return "ok"
 
