@@ -30,6 +30,17 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+        # Per-turn foreground tool-admission deadline for gateway sessions.
+        # Once exhausted, only one safe background/durable handoff is allowed;
+        # already-running tools and LLM calls are not interrupted. 0 preserves
+        # the historical unlimited foreground behavior.
+        "foreground_budget_seconds": 0,
+        # Platforms where a successful detached delegate_task immediately
+        # closes the parent turn with a deterministic acknowledgment.
+        "strict_background_handoff_platforms": [],
+        "strict_background_handoff_ack": (
+            "I'm checking this in the background and will return here with the result."
+        ),
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -1131,6 +1142,10 @@ DEFAULT_CONFIG = {
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # Background terminal/watch notifications. May be overridden under
+        # display.platforms.<platform>. Async delegation final results use a
+        # separate delivery path and remain enabled when this is "off".
+        "background_process_notifications": "all",
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.

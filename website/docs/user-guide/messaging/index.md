@@ -523,6 +523,17 @@ display:
   background_process_notifications: all    # all | result | error | off
 ```
 
+This setting can be overridden per platform. The following keeps background
+terminal/process events out of Slack while preserving the final result delivered
+by a detached `delegate_task`:
+
+```yaml
+display:
+  platforms:
+    slack:
+      background_process_notifications: off
+```
+
 | Mode | What you receive |
 |------|-----------------|
 | `all` | Running-output updates **and** the final completion message (default) |

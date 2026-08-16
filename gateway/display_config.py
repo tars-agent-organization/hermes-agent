@@ -52,6 +52,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Disable when the platform should steer silently (the text still lands in
     # the active run; only the confirmation echo is suppressed).
     "busy_steer_ack_enabled": True,
+    # Background terminal/watch notifications. Async delegate_task completion
+    # delivery is a separate channel and is intentionally unaffected.
+    "background_process_notifications": "all",
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
@@ -300,6 +303,13 @@ def _normalise(setting: str, value: Any) -> Any:
     if setting == "tool_progress_grouping":
         val = str(value).lower()
         return val if val in ("accumulate", "separate") else "accumulate"
+    if setting == "background_process_notifications":
+        if value is False:
+            return "off"
+        if value is True:
+            return "all"
+        val = str(value).strip().lower()
+        return val if val in {"all", "result", "error", "off"} else "all"
     if setting == "reasoning_style":
         val = str(value).lower()
         return val if val in ("code", "blockquote", "subtext") else "code"

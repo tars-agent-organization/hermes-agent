@@ -998,6 +998,37 @@ agent:
 
 For a user/plugin policy gate at the same point — keep the agent going with your own checks — see the [`pre_verify` hook](/user-guide/features/hooks#pre_verify).
 
+## Gateway Foreground Budget
+
+`agent.foreground_budget_seconds` is an optional deadline for admitting new
+foreground tool calls during each gateway conversation turn. It accepts only a
+finite, non-negative number. The default is `0` (disabled), which preserves the
+historical unlimited foreground behavior.
+
+```yaml
+agent:
+  foreground_budget_seconds: 30  # 0 disables; gateway sessions only
+```
+
+The monotonic timer starts before turn setup. Once the deadline has passed,
+Hermes checks every new tool dispatch and blocks foreground work. This is not a
+hard wall-clock limit for the whole turn: it does not interrupt an LLM request
+or a tool already in flight. A tool already admitted is allowed to finish.
+Exactly one safe handoff may still be started:
+
+- `delegate_task`;
+- `terminal` with `background: true`;
+- `cronjob` with `action: create`.
+
+After one handoff is accepted, later tool calls in that turn are blocked and the
+model returns one concise handoff confirmation. Hermes does not synthesize a
+delegation prompt or automatically move arbitrary in-flight state into a
+background job, which avoids duplicated side effects and missing context.
+
+The opt-in `codex_app_server` runtime executes tools outside Hermes'
+dispatcher. When a positive foreground budget applies to such a gateway
+session, the turn fails closed before that runtime starts.
+
 ## Standing Goals (`/goal`)
 
 When a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.

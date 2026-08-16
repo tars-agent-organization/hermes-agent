@@ -1645,6 +1645,13 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    from agent.foreground_budget import foreground_budget_guard_from_config
+    agent._foreground_budget_guard = foreground_budget_guard_from_config(
+        _agent_cfg,
+        gateway_session_key=gateway_session_key,
+        platform=platform,
+    )
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

@@ -125,6 +125,18 @@ class TestResolveChannelPrompts:
         adapter.config.extra = {"channel_prompts": {100: "Research mode"}}
         assert adapter._resolve_channel_prompt("100") is None
 
+    def test_wildcard_fallback_applies_when_channel_and_parent_are_unconfigured(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_prompts": {
+                "100": "Exact prompt",
+                "*": "Platform-wide prompt",
+            }
+        }
+
+        assert adapter._resolve_channel_prompt("100") == "Exact prompt"
+        assert adapter._resolve_channel_prompt("999") == "Platform-wide prompt"
+
 
 @pytest.mark.asyncio
 async def test_retry_preserves_channel_prompt(monkeypatch):
@@ -152,5 +164,4 @@ async def test_retry_preserves_channel_prompt(monkeypatch):
     assert result == "ok"
     retried_event = runner._handle_message.await_args.args[0]
     assert retried_event.channel_prompt == "Channel prompt"
-
 

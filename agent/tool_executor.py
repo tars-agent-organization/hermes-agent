@@ -301,6 +301,44 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _foreground_budget_block_result(
+    agent,
+    function_name: str,
+    function_args: dict,
+) -> Optional[str]:
+    """Return a synthetic denial when the per-turn foreground budget says no."""
+    guard = getattr(agent, "_foreground_budget_guard", None)
+    if guard is None:
+        return None
+    decision = guard.before_tool(function_name, function_args)
+    if decision.allowed:
+        return None
+    return json.dumps(
+        {
+            "error": decision.code,
+            "status": "blocked",
+            "message": decision.message,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _observe_background_handoff_result(
+    agent,
+    function_name: str,
+    function_args: dict,
+    function_result: Any,
+) -> bool:
+    """Record a successful strict background handoff on the active guard."""
+    guard = getattr(agent, "_foreground_budget_guard", None)
+    if guard is None:
+        return False
+    observe = getattr(guard, "observe_tool_result", None)
+    if not callable(observe):
+        return False
+    return bool(observe(function_name, function_args, function_result))
+
+
 def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -539,6 +577,14 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
+            budget_block = _foreground_budget_block_result(
+                agent, function_name, final_args
+            )
+            if budget_block is not None:
+                block_message = budget_block
+                block_error_type = "foreground_budget_block"
+
+        if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():
@@ -577,7 +623,11 @@ def _run_agent_tool_execution_middleware(
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                result = (
+                    block_message
+                    if block_error_type == "foreground_budget_block"
+                    else json.dumps({"error": block_message}, ensure_ascii=False)
+                )
                 error_type = block_error_type
                 error_message = block_message
             else:
@@ -1492,6 +1542,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Text-only servers get a string-safe fallback here so a rejected
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
+        _observe_background_handoff_result(agent, name, args, function_result)
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
         tool_message = make_tool_result_message(
             name,
@@ -2262,6 +2313,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
+        _strict_background_handoff = _observe_background_handoff_result(
+            agent, function_name, function_args, function_result
+        )
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
@@ -2325,6 +2379,29 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _fr_str = function_result if isinstance(function_result, str) else str(function_result)
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
+
+        if _strict_background_handoff:
+            # Preserve provider tool-call/result alternation for any extra
+            # calls emitted in the same assistant message, but never execute
+            # work after a detached delegation has been accepted.
+            for skipped_tc in assistant_message.tool_calls[i:]:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    (
+                        "[Tool execution skipped — background delegation was "
+                        "dispatched and the parent turn is ending now]"
+                    ),
+                    skipped_tc.id,
+                    effect_disposition="none",
+                ))
+                if not _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"skipped tool result {skipped_name}",
+                ):
+                    return
+            break
 
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i

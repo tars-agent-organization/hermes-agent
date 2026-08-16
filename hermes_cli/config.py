@@ -17,6 +17,7 @@ This module provides:
 import copy
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -1918,6 +1919,43 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # Foreground tool-admission budget must fail closed.
+    agent_cfg = config.get("agent")
+    if isinstance(agent_cfg, dict) and "foreground_budget_seconds" in agent_cfg:
+        foreground_budget = agent_cfg["foreground_budget_seconds"]
+        if (
+            isinstance(foreground_budget, bool)
+            or not isinstance(foreground_budget, (int, float))
+            or not math.isfinite(foreground_budget)
+            or foreground_budget < 0
+        ):
+            issues.append(ConfigIssue(
+                "error",
+                "agent.foreground_budget_seconds must be a finite non-negative number",
+                "Use 0 to disable the guard, or a numeric value such as 30",
+            ))
+
+    if isinstance(agent_cfg, dict) and "strict_background_handoff_platforms" in agent_cfg:
+        strict_platforms = agent_cfg["strict_background_handoff_platforms"]
+        if not isinstance(strict_platforms, list) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in strict_platforms
+        ):
+            issues.append(ConfigIssue(
+                "error",
+                "agent.strict_background_handoff_platforms must be a list of platform names",
+                "Use a YAML list such as [slack], or [] to disable strict handoff",
+            ))
+
+    if isinstance(agent_cfg, dict) and "strict_background_handoff_ack" in agent_cfg:
+        strict_ack = agent_cfg["strict_background_handoff_ack"]
+        if not isinstance(strict_ack, str) or not strict_ack.strip():
+            issues.append(ConfigIssue(
+                "error",
+                "agent.strict_background_handoff_ack must be a non-empty string",
+                "Set the short acknowledgment sent after background dispatch",
+            ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")

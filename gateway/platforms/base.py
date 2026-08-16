@@ -2783,7 +2783,8 @@ def resolve_channel_prompt(
 
     Looks up ``channel_prompts`` in the adapter's ``config.extra`` dict.
     Prefers an exact match on *channel_id*; falls back to *parent_id*
-    (useful for forum threads / child channels inheriting a parent prompt).
+    (useful for forum threads / child channels inheriting a parent prompt),
+    then to the optional ``"*"`` platform-wide prompt.
 
     Returns the prompt string, or None if no match is found.  Blank/whitespace-
     only prompts are treated as absent.
@@ -2792,7 +2793,7 @@ def resolve_channel_prompt(
     if not isinstance(prompts, dict):
         return None
 
-    for key in (channel_id, parent_id):
+    for key in (channel_id, parent_id, "*"):
         if not key:
             continue
         prompt = prompts.get(key)

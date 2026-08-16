@@ -1460,6 +1460,31 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    foreground_guard = getattr(agent, "_foreground_budget_guard", None)
+    if foreground_guard is not None:
+        foreground_guard.start_turn()
+        # The Codex app-server owns and executes its tools out of process, so
+        # Hermes cannot interpose at the pre-dispatch boundary. Fail closed
+        # rather than advertise an admission deadline this runtime could bypass.
+        if (
+            foreground_guard.enabled
+            and getattr(agent, "api_mode", None) == "codex_app_server"
+        ):
+            message = (
+                "A foreground budget is configured for this gateway session, "
+                "but the codex_app_server runtime executes tools outside the "
+                "Hermes dispatcher. The turn was not started because the "
+                "tool-admission deadline cannot be enforced on that runtime."
+            )
+            return {
+                "final_response": message,
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": "foreground_budget_unsupported_runtime",
+            }
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -6796,6 +6821,21 @@ def run_conversation(
                             except Exception:
                                 pass
                     break
+
+                if foreground_guard is not None:
+                    consume_handoff_ack = getattr(
+                        foreground_guard, "consume_strict_handoff_ack", None
+                    )
+                    handoff_ack = (
+                        consume_handoff_ack()
+                        if callable(consume_handoff_ack)
+                        else None
+                    )
+                    if handoff_ack:
+                        _turn_exit_reason = "strict_background_handoff"
+                        final_response = handoff_ack
+                        agent._session_messages = messages
+                        break
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
