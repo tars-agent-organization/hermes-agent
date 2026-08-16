@@ -140,6 +140,18 @@ class TestResolveChannelPrompts:
         }
         assert adapter._resolve_channel_prompt("999", parent_id="200") == "Thread override"
 
+    def test_wildcard_fallback_applies_when_channel_and_parent_are_unconfigured(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_prompts": {
+                "100": "Exact prompt",
+                "*": "Platform-wide prompt",
+            }
+        }
+
+        assert adapter._resolve_channel_prompt("100") == "Exact prompt"
+        assert adapter._resolve_channel_prompt("999") == "Platform-wide prompt"
+
     def test_build_message_event_sets_channel_prompt(self):
         adapter = _make_adapter()
         adapter.config.extra = {"channel_prompts": {"321": "Command prompt"}}

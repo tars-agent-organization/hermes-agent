@@ -4994,6 +4994,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         input_mode = GatewayRunner._load_busy_input_mode()
         return "queue" if input_mode == "queue" else "interrupt"
 
+    def _busy_modes_for_source(self, source: Any) -> tuple[str, str]:
+        """Resolve busy input/text modes with an optional platform override."""
+        input_mode = self._busy_input_mode
+        text_mode = getattr(self, "_busy_text_mode", "interrupt")
+        try:
+            cfg = _load_gateway_runtime_config()
+            platform_key = _platform_config_key(source.platform)
+            platform_cfg = cfg_get(
+                cfg, "display", "platforms", platform_key, default={}
+            )
+            if isinstance(platform_cfg, dict):
+                raw_input = str(
+                    platform_cfg.get("busy_input_mode", "") or ""
+                ).strip().lower()
+                if raw_input in {"interrupt", "queue", "steer"}:
+                    input_mode = raw_input
+                    text_mode = "queue" if raw_input == "queue" else "interrupt"
+                raw_text = str(
+                    platform_cfg.get("busy_text_mode", "") or ""
+                ).strip().lower()
+                if raw_text in {"interrupt", "queue"}:
+                    text_mode = raw_text
+        except Exception:
+            logger.debug("Could not resolve platform-scoped busy mode", exc_info=True)
+        return input_mode, text_mode
+
     @staticmethod
     def _load_restart_drain_timeout() -> float:
         """Load graceful gateway restart/stop drain timeout in seconds."""
@@ -5014,7 +5040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return value
 
     @staticmethod
-    def _load_background_notifications_mode() -> str:
+    def _load_background_notifications_mode(platform_name: str = "") -> str:
         """Load background process notification mode from config or env var.
 
         Modes:
@@ -5026,7 +5052,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         mode = os.getenv("HERMES_BACKGROUND_NOTIFICATIONS", "")
         if not mode:
             cfg = _load_gateway_runtime_config()
-            raw = cfg_get(cfg, "display", "background_process_notifications")
+            if platform_name:
+                from gateway.display_config import resolve_display_setting
+
+                raw = resolve_display_setting(
+                    cfg,
+                    str(platform_name).strip().lower(),
+                    "background_process_notifications",
+                    "all",
+                )
+            else:
+                raw = cfg_get(cfg, "display", "background_process_notifications")
             if raw is False:
                 mode = "off"
             elif raw not in {None, ""}:
@@ -5475,8 +5511,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         running_agent = self._running_agents.get(session_key)
 
-        effective_mode = self._busy_input_mode
-        busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
+        effective_mode, busy_text_mode = self._busy_modes_for_source(event.source)
         if (
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
@@ -5566,6 +5601,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 running_agent.interrupt(event.text)
             except Exception:
                 pass  # don't let interrupt failure block the ack
+
+        # WhatsApp groups should never receive operational busy-state bubbles.
+        # Preserve the interrupt/queue/steer semantics above, but keep internal
+        # lifecycle chatter out of the shared conversation. DMs and other
+        # platforms retain their existing acknowledgement behavior. The JID
+        # suffix is a fail-safe when chat_type metadata is missing or wrong.
+        chat_type = str(getattr(event.source, "chat_type", "") or "").lower()
+        chat_id = str(getattr(event.source, "chat_id", "") or "")
+        is_whatsapp_group = (
+            event.source.platform == Platform.WHATSAPP
+            and (chat_type == "group" or chat_id.endswith("@g.us"))
+        )
+        if is_whatsapp_group:
+            logger.debug("Busy ack suppressed for WhatsApp group session %s", session_key)
+            return True
 
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
@@ -9568,6 +9618,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
                 return None
 
+            _priority_busy_mode, _ = self._busy_modes_for_source(source)
             _telegram_followup_grace = float(
                 os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
             )
@@ -9586,7 +9637,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    if self._busy_input_mode == "queue":
+                    if _priority_busy_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
                         merge_pending_message_event(
@@ -9624,11 +9675,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
-            if self._busy_input_mode == "queue":
+            if _priority_busy_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None
-            if self._busy_input_mode == "steer":
+            if _priority_busy_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
                 # is empty, the agent lacks steer(), or steer() rejects.
@@ -15764,14 +15815,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_name = watcher.get("user_name", "")
         message_id = str(watcher.get("message_id") or "").strip() or None
         agent_notify = watcher.get("notify_on_complete", False)
-        notify_mode = self._load_background_notifications_mode()
+        notify_mode = self._load_background_notifications_mode(platform_name)
 
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
 
-        if notify_mode == "off" and not agent_notify:
+        if notify_mode == "off":
             # Still wait for the process to exit so we can log it, but don't
-            # push any messages to the user.
+            # push any messages or synthetic agent turns to the user. Detached
+            # delegate_task results use _async_delegation_watcher instead and
+            # therefore still return to the originating conversation.
             while True:
                 await asyncio.sleep(interval)
                 session = process_registry.get(session_id)

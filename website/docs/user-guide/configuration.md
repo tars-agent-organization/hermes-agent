@@ -839,6 +839,47 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+## Gateway Foreground Budget
+
+`agent.foreground_budget_seconds` is an optional deadline for admitting new
+foreground tool calls during each gateway conversation turn. It accepts only a
+finite, non-negative number. The default is `0` (disabled), which preserves the
+historical unlimited foreground behavior.
+
+```yaml
+agent:
+  foreground_budget_seconds: 30  # 0 disables; gateway sessions only
+```
+
+The monotonic timer starts before turn setup. Once the deadline has passed,
+Hermes checks every new tool dispatch and blocks foreground work. This is not a
+hard wall-clock limit for the whole turn: it does not interrupt an LLM request
+or a tool already in flight. A tool that
+was already admitted is allowed to finish — Hermes does not forcibly cancel a
+possibly side-effecting call. Exactly one safe handoff may still be started:
+
+- `delegate_task` (top-level model delegations are background jobs);
+- `terminal` with the JSON argument `background: true`;
+- `cronjob` with `action: create` for durable scheduled work.
+
+After one handoff is accepted, every later tool call in that turn is blocked and
+the model is instructed to return one concise handoff confirmation. Hermes does
+**not** synthesize a delegation prompt or automatically move arbitrary in-flight
+state into a background job: doing so could duplicate side effects or omit
+critical context. If the model does not issue a safe handoff, Hermes returns the
+blocked result and the model must report status instead.
+
+This setting also does not classify projects or route them to the background
+immediately. Treat `30` seconds as a maximum fallback admission window, not as
+permission to keep a project in the foreground for 30 seconds. Operational
+policy should delegate projects, multi-step coding, and extensive research as
+soon as they are recognized.
+
+The opt-in `codex_app_server` runtime executes tools outside Hermes' dispatcher,
+so Hermes cannot interpose at the pre-dispatch boundary. When a positive
+foreground budget applies to such a gateway session, the turn fails closed
+before that runtime starts rather than silently bypassing the configured guard.
+
 ## Standing Goals (`/goal`)
 
 When a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.

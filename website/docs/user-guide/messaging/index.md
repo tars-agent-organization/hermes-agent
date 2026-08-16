@@ -326,12 +326,12 @@ By default, messaging a busy agent interrupts it. Two other modes are available:
 ```yaml
 display:
   busy_input_mode: steer   # or queue, or interrupt (default)
-  busy_ack_enabled: true   # set to false to suppress the ⚡/⏳/⏩ chat reply entirely
+  busy_ack_enabled: true   # set to false to suppress busy replies, including blocked slash-command notices
 ```
 
 The first time you message a busy agent on any platform, Hermes appends a one-line reminder to the busy-ack explaining the knob (`"💡 First-time tip — …"`). The reminder fires once per install — a flag under `onboarding.seen.busy_input_prompt` latches it. Delete that key to see the tip again.
 
-If you find the busy-ack noisy — especially with voice input or rapid-fire messages — set `display.busy_ack_enabled: false`. Your input is still queued/steered/interrupts as normal, only the chat reply is silenced.
+If you find busy notices noisy — especially with voice input, rapid-fire messages, or blocked slash commands — set `display.busy_ack_enabled: false`. Ordinary input is still queued/steered/interrupted as normal; commands blocked during an active turn remain blocked and are silently dropped.
 
 ## Tool Progress Notifications
 
@@ -406,6 +406,17 @@ When the agent running a background session uses `terminal(background=true)` to 
 ```yaml
 display:
   background_process_notifications: all    # all | result | error | off
+```
+
+This setting can be overridden per platform. For example, the following keeps
+background terminal/process events out of Slack while preserving the single
+final result delivered by `delegate_task(background=true)`:
+
+```yaml
+display:
+  platforms:
+    slack:
+      background_process_notifications: off
 ```
 
 | Mode | What you receive |

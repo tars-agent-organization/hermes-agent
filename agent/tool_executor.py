@@ -185,6 +185,44 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _foreground_budget_block_result(
+    agent,
+    function_name: str,
+    function_args: dict,
+) -> Optional[str]:
+    """Return a synthetic denial when the per-turn foreground budget says no."""
+    guard = getattr(agent, "_foreground_budget_guard", None)
+    if guard is None:
+        return None
+    decision = guard.before_tool(function_name, function_args)
+    if decision.allowed:
+        return None
+    return json.dumps(
+        {
+            "error": decision.code,
+            "status": "blocked",
+            "message": decision.message,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _observe_background_handoff_result(
+    agent,
+    function_name: str,
+    function_args: dict,
+    function_result: Any,
+) -> bool:
+    """Record a successful strict background handoff on the active guard."""
+    guard = getattr(agent, "_foreground_budget_guard", None)
+    if guard is None:
+        return False
+    observe = getattr(guard, "observe_tool_result", None)
+    if not callable(observe):
+        return False
+    return bool(observe(function_name, function_args, function_result))
+
+
 def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -444,23 +482,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
-
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
+            budget_block = _foreground_budget_block_result(
+                agent, function_name, function_args
+            )
+            if budget_block is not None:
+                block_result = budget_block
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=function_name,
@@ -469,15 +495,28 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
+                    error_type="foreground_budget_block",
+                    error_message=budget_block,
                     middleware_trace=list(middleware_trace),
                 )
             else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+                    block_message = resolve_pre_tool_block(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
+                except Exception:
+                    block_message = None
+
+                if block_message is not None:
+                    block_result = json.dumps({"error": block_message}, ensure_ascii=False)
                     _emit_terminal_post_tool_call(
                         agent,
                         function_name=function_name,
@@ -486,10 +525,27 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         effective_task_id=effective_task_id,
                         tool_call_id=getattr(tool_call, "id", "") or "",
                         status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
+                        error_type="plugin_block",
+                        error_message=block_message,
                         middleware_trace=list(middleware_trace),
                     )
+                else:
+                    guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = agent._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
+                        _emit_terminal_post_tool_call(
+                            agent,
+                            function_name=function_name,
+                            function_args=function_args,
+                            result=block_result,
+                            effective_task_id=effective_task_id,
+                            tool_call_id=getattr(tool_call, "id", "") or "",
+                            status="blocked",
+                            error_type="guardrail_block",
+                            error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
+                            middleware_trace=list(middleware_trace),
+                        )
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
@@ -968,6 +1024,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Text-only servers get a string-safe fallback here so a rejected
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
+        _observe_background_handoff_result(agent, name, args, function_result)
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
         tool_message = make_tool_result_message(
             name,
@@ -1095,27 +1152,34 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
 
-        # Check plugin hooks for a block directive before executing.
+        # Check the foreground admission deadline, then plugin hooks, before executing.
         _block_msg: Optional[str] = None
         _block_error_type = "plugin_block"
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                _block_msg = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                pass
+            _budget_block = _foreground_budget_block_result(
+                agent, function_name, function_args
+            )
+            if _budget_block is not None:
+                _block_msg = _budget_block
+                _block_error_type = "foreground_budget_block"
+            else:
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+                    _block_msg = resolve_pre_tool_block(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
+                except Exception:
+                    pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
@@ -1201,8 +1265,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_start_time = time.time()
 
         if _block_msg is not None:
-            # Tool blocked by plugin policy — return error without executing.
-            function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+            # Tool blocked before dispatch — preserve the foreground-budget
+            # payload, while legacy plugin/scope blocks keep their wrapper.
+            function_result = (
+                _block_msg
+                if _block_error_type == "foreground_budget_block"
+                else json.dumps({"error": _block_msg}, ensure_ascii=False)
+            )
             tool_duration = 0.0
             _emit_terminal_post_tool_call(
                 agent,
@@ -1652,6 +1721,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
+        _strict_background_handoff = _observe_background_handoff_result(
+            agent, function_name, function_args, function_result
+        )
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
@@ -1692,6 +1764,28 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _fr_str = function_result if isinstance(function_result, str) else str(function_result)
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
+
+        if _strict_background_handoff:
+            # Preserve provider tool-call/result alternation for any extra
+            # calls emitted in the same assistant message, but never execute
+            # work after a detached delegation has been accepted.
+            for skipped_tc in assistant_message.tool_calls[i:]:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    (
+                        "[Tool execution skipped — background delegation was "
+                        "dispatched and the parent turn is ending now]"
+                    ),
+                    skipped_tc.id,
+                    effect_disposition="none",
+                ))
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"skipped tool result {skipped_name}",
+                )
+            break
 
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i

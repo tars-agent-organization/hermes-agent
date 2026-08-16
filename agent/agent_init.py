@@ -1340,6 +1340,12 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+    from agent.foreground_budget import foreground_budget_guard_from_config
+    agent._foreground_budget_guard = foreground_budget_guard_from_config(
+        _agent_cfg,
+        gateway_session_key=gateway_session_key,
+        platform=platform,
+    )
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(

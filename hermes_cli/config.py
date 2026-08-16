@@ -15,6 +15,7 @@ This module provides:
 import copy
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -989,6 +990,18 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 90,
+        # Per-turn foreground tool-admission deadline for gateway sessions.
+        # Once exhausted, only one safe background/durable handoff is allowed;
+        # already-running tools and LLM calls are not interrupted. 0 preserves
+        # the historical unlimited foreground behavior.
+        "foreground_budget_seconds": 0,
+        # Platforms where a successful detached delegate_task immediately
+        # closes the parent turn with a deterministic acknowledgment. The
+        # detached result still re-enters the originating conversation later.
+        "strict_background_handoff_platforms": [],
+        "strict_background_handoff_ack": (
+            "I'm checking this in the background and will return here with the result."
+        ),
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -1764,6 +1777,10 @@ DEFAULT_CONFIG = {
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # Background terminal/watch notifications. May be overridden under
+        # display.platforms.<platform>. Async delegation final results use a
+        # separate delivery path and remain enabled when this is "off".
+        "background_process_notifications": "all",
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.
@@ -5272,6 +5289,43 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── foreground tool-admission budget must fail closed ───────────────
+    agent_cfg = config.get("agent")
+    if isinstance(agent_cfg, dict) and "foreground_budget_seconds" in agent_cfg:
+        foreground_budget = agent_cfg["foreground_budget_seconds"]
+        if (
+            isinstance(foreground_budget, bool)
+            or not isinstance(foreground_budget, (int, float))
+            or not math.isfinite(foreground_budget)
+            or foreground_budget < 0
+        ):
+            issues.append(ConfigIssue(
+                "error",
+                "agent.foreground_budget_seconds must be a finite non-negative number",
+                "Use 0 to disable the guard, or a numeric value such as 30",
+            ))
+
+    if isinstance(agent_cfg, dict) and "strict_background_handoff_platforms" in agent_cfg:
+        strict_platforms = agent_cfg["strict_background_handoff_platforms"]
+        if not isinstance(strict_platforms, list) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in strict_platforms
+        ):
+            issues.append(ConfigIssue(
+                "error",
+                "agent.strict_background_handoff_platforms must be a list of platform names",
+                "Use a YAML list such as [slack], or [] to disable strict handoff",
+            ))
+
+    if isinstance(agent_cfg, dict) and "strict_background_handoff_ack" in agent_cfg:
+        strict_ack = agent_cfg["strict_background_handoff_ack"]
+        if not isinstance(strict_ack, str) or not strict_ack.strip():
+            issues.append(ConfigIssue(
+                "error",
+                "agent.strict_background_handoff_ack must be a non-empty string",
+                "Set the short acknowledgment sent after background dispatch",
+            ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")

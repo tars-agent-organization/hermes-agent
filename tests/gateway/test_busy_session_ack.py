@@ -98,6 +98,34 @@ def _make_adapter(platform_val="telegram"):
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
 
+    def test_busy_mode_can_be_scoped_to_slack(self, monkeypatch):
+        import gateway.run as gateway_run
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "interrupt"
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_runtime_config",
+            lambda: {
+                "display": {
+                    "platforms": {
+                        "slack": {"busy_input_mode": "queue"},
+                    }
+                }
+            },
+        )
+
+        slack_modes = runner._busy_modes_for_source(
+            _make_event(platform_val="slack").source
+        )
+        telegram_modes = runner._busy_modes_for_source(
+            _make_event(platform_val="telegram").source
+        )
+
+        assert slack_modes == ("queue", "queue")
+        assert telegram_modes == ("interrupt", "interrupt")
+
     @pytest.mark.asyncio
     async def test_handle_message_queue_mode_queues_without_interrupt(self):
         """Runner queue mode must not interrupt an active agent for text follow-ups."""
@@ -210,6 +238,104 @@ class TestBusySessionAck:
 
         # Verify agent interrupt was called
         agent.interrupt.assert_called_once_with("Are you working?")
+
+    @pytest.mark.asyncio
+    async def test_group_busy_followup_interrupts_silently(self):
+        """Busy follow-ups in groups keep semantics but never emit operational acks."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="whatsapp")
+
+        source = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="family@g.us",
+            chat_type="group",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="segunda mensagem",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="msg-group-2",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+
+        agent = MagicMock()
+        agent._active_children = []
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        agent.interrupt.assert_called_once_with("segunda mensagem")
+        assert adapter._pending_messages.get(sk) is event
+        adapter._send_with_retry.assert_not_called()
+        assert sk not in runner._busy_ack_ts
+
+    @pytest.mark.asyncio
+    async def test_whatsapp_group_jid_fallback_suppresses_busy_ack(self):
+        """WhatsApp group JIDs fail safe even if chat_type metadata is wrong."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="whatsapp")
+
+        source = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="family@g.us",
+            chat_type="dm",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="outra mensagem",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="msg-group-jid",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+
+        agent = MagicMock()
+        agent._active_children = []
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        agent.interrupt.assert_called_once_with("outra mensagem")
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_whatsapp_group_keeps_existing_busy_ack(self):
+        """The WhatsApp-specific policy must not change other platforms."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="telegram")
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="telegram-group",
+            chat_type="group",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="follow up",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="msg-telegram-group",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+
+        agent = MagicMock()
+        agent._active_children = []
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        agent.interrupt.assert_called_once_with("follow up")
+        adapter._send_with_retry.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_queue_mode_suppresses_interrupt_and_updates_ack(self):

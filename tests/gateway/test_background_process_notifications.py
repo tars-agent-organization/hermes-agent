@@ -113,6 +113,21 @@ class TestLoadBackgroundNotificationsMode:
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
         assert GatewayRunner._load_background_notifications_mode() == "all"
 
+    def test_platform_override_wins_over_global_config(self, monkeypatch, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "display:\n"
+            "  background_process_notifications: all\n"
+            "  platforms:\n"
+            "    slack:\n"
+            "      background_process_notifications: off\n"
+        )
+        import gateway.run as gw
+        monkeypatch.setattr(gw, "_hermes_home", tmp_path)
+        monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
+
+        assert GatewayRunner._load_background_notifications_mode("slack") == "off"
+        assert GatewayRunner._load_background_notifications_mode("telegram") == "all"
+
 
 # ---------------------------------------------------------------------------
 # _run_process_watcher integration tests
@@ -355,6 +370,37 @@ async def test_agent_notification_no_message_id_is_tolerated(monkeypatch, tmp_pa
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.message_id is None
+
+
+@pytest.mark.asyncio
+async def test_off_suppresses_agent_completion_injection(monkeypatch, tmp_path):
+    """Explicit off is silent even for notify_on_complete watcher events."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="done\n", exited=True, exit_code=0, command="sleep 1",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "off")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    watcher = {
+        "session_id": "proc_silent",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }
+
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
