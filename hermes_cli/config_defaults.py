@@ -86,6 +86,16 @@ DEFAULT_CONFIG = {
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
+        # Per-turn tool-admission deadline for gateway sessions. Once exhausted,
+        # only one durable/background handoff may start; already-running work is
+        # never interrupted. Zero preserves unbounded foreground behavior.
+        "foreground_budget_seconds": 0,
+        # A successful detached delegate_task immediately closes the parent turn
+        # on these platforms and returns the deterministic acknowledgment below.
+        "strict_background_handoff_platforms": [],
+        "strict_background_handoff_ack": (
+            "I'm checking this in the background and will return here with the result."
+        ),
         # Max seconds an alias routing key waits for the active turn holding the same session lease;
         # on expiry the message is rejected with a resend notice. Keep short: Telegram dispatches
         # sequentially, so a waiter delays unrelated topics. Non-positive -> 5s.

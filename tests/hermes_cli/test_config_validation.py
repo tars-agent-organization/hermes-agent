@@ -1,11 +1,38 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
+import math
 
 import pytest
 
 from hermes_cli.config import (
     validate_config_structure,
 )
+
+
+class TestForegroundBudgetValidation:
+    @pytest.mark.parametrize("value", ["abc", "30", -1, math.nan, math.inf, -math.inf, True, None])
+    def test_rejects_non_finite_or_negative_values(self, value):
+        issues = validate_config_structure({"agent": {"foreground_budget_seconds": value}})
+        assert any("agent.foreground_budget_seconds" in issue.message for issue in issues)
+
+    @pytest.mark.parametrize("value", [0, 0.0, 0.25, 15])
+    def test_accepts_finite_non_negative_values(self, value):
+        issues = validate_config_structure({"agent": {"foreground_budget_seconds": value}})
+        assert not any("agent.foreground_budget_seconds" in issue.message for issue in issues)
+
+    @pytest.mark.parametrize("value", ["slack", [""], [1], None])
+    def test_rejects_invalid_strict_handoff_platform_lists(self, value):
+        issues = validate_config_structure({"agent": {"strict_background_handoff_platforms": value}})
+        assert any("agent.strict_background_handoff_platforms" in issue.message for issue in issues)
+
+    def test_accepts_strict_handoff_platform_list_and_ack(self):
+        issues = validate_config_structure({
+            "agent": {
+                "strict_background_handoff_platforms": ["slack"],
+                "strict_background_handoff_ack": "Checking in background.",
+            }
+        })
+        assert not any("strict_background_handoff" in issue.message for issue in issues)
 
 
 class TestCustomProvidersValidation:

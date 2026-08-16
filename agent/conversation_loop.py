@@ -1734,6 +1734,27 @@ def run_conversation(
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
 
+    foreground_guard = getattr(agent, "_foreground_budget_guard", None)
+    if foreground_guard is not None:
+        foreground_guard.start_turn()
+        agent._strict_background_handoff_observed = False
+        # The app-server executes tools outside Hermes, so its admission
+        # deadline cannot be enforced. Fail closed when the guard is active.
+        if foreground_guard.enabled and getattr(agent, "api_mode", None) == "codex_app_server":
+            message = (
+                "A foreground budget is configured for this gateway session, "
+                "but the codex_app_server runtime executes tools outside the "
+                "Hermes dispatcher. The turn was not started."
+            )
+            return {
+                "final_response": message,
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": "foreground_budget_unsupported_runtime",
+            }
+
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so

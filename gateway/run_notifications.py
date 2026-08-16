@@ -1028,7 +1028,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 from tools.process_registry_notifications import should_surface_notification
                 if not should_surface_notification(evt):
                     continue
-                if self._load_background_notifications_mode() == "off":
+                if self._load_background_notifications_mode(str(evt.get("platform") or "")) == "off":
                     continue
                 synth_text = _format_gateway_process_notification(evt)
                 if not synth_text:
@@ -1979,10 +1979,10 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         # The mode belongs to the profile that started the process; recovered watchers run in the
         # root context, so resolve it under the owning profile's scope (no-op for the default).
         async with self._completion_event_scope(watcher):
-            notify_mode = self._load_background_notifications_mode()
+            notify_mode = self._load_background_notifications_mode(platform_name)
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
-        silent = notify_mode == "off" and not agent_notify
+        silent = notify_mode == "off"
         last_output_len = 0
         while True:
             await asyncio.sleep(interval)

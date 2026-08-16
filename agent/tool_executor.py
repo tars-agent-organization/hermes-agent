@@ -683,6 +683,29 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         return None, ref.args
 
 
+def _foreground_budget_block(agent, ref: _ToolCallRef) -> dict[str, Any] | None:
+    """Return the structured denial for a tool that misses the foreground deadline."""
+    guard = getattr(agent, "_foreground_budget_guard", None)
+    if guard is None:
+        return None
+    decision = guard.before_tool(ref.name, ref.args)
+    if decision.allowed:
+        return None
+    return {
+        "error": decision.code,
+        "status": "blocked",
+        "message": decision.message,
+    }
+
+
+def _observe_background_handoff(agent, ref: _ToolCallRef, result: Any) -> None:
+    """Latch a successfully dispatched strict background delegation."""
+    guard = getattr(agent, "_foreground_budget_guard", None)
+    observe = getattr(guard, "observe_tool_result", None)
+    if callable(observe) and observe(ref.name, ref.args, result):
+        agent._strict_background_handoff_observed = True
+
+
 def _dispatch_authorized_once(
     agent,
     state: _ManagedToolResult,
@@ -707,12 +730,18 @@ def _dispatch_authorized_once(
             callback()
 
     block_message, block_error_type = scope_block, "tool_scope_block"
+    block_body = None
     if block_message is None:
+        block_body = _foreground_budget_block(agent, ref)
+        if block_body is not None:
+            block_error_type = "foreground_budget_block"
+    if block_message is None and block_body is None:
         block_error_type = "plugin_block"
         resolve = lambda: _pre_tool_block(agent, ref)
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
-    block_body = None if block_message is None else {"error": block_message}
+    if block_body is None and block_message is not None:
+        block_body = {"error": block_message}
 
     # Checked once, after plugin modify hooks (which may replace arguments) and
     # before guardrails or real dispatch: a copied compression marker in an
@@ -1088,6 +1117,7 @@ def _commit_tool_result(
     observe_tool_outcome(agent, function_name, is_error)
     if observed:
         if not blocked:
+            _observe_background_handoff(agent, ref, function_result)
             function_result = agent._append_guardrail_observation(
                 function_name, function_args, function_result, failed=is_error, tool_call_id=tool_call_id,
             )
@@ -1840,11 +1870,15 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
+    agent._strict_background_handoff_stop_batch = False
     for calls in terminal_approval_runs(agent, assistant_message.tool_calls):
         with terminal_approval_batch(agent, calls, messages, effective_task_id):
             _execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=calls), messages, effective_task_id, api_call_count, finalize=False)
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_strict_background_handoff_stop_batch", False):
+            break
+    agent._strict_background_handoff_stop_batch = False
     if finalize:
         _finalize_tool_batch(agent, messages, effective_task_id, len(assistant_message.tool_calls), _budget_for_agent(agent))
 
@@ -1892,6 +1926,23 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
         if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i,
                                           budget=_tool_budget, transform_applied=dispatch.transform_applied):
             return
+
+        if getattr(agent, "_strict_background_handoff_observed", False):
+            agent._strict_background_handoff_observed = False
+            agent._strict_background_handoff_stop_batch = True
+            if not _append_skipped_tool_results(
+                agent,
+                messages,
+                tool_calls[i:],
+                effective_task_id,
+                content=(
+                    "[Tool execution skipped — background delegation was "
+                    "dispatched and the parent turn is ending now]"
+                ),
+                flush_stage="strict background handoff skipped tool result",
+            ):
+                return
+            break
 
         if agent._interrupt_requested and i < len(tool_calls):
             if not _skip_remaining_sequential(

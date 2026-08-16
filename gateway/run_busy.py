@@ -879,6 +879,15 @@ class GatewayBusySessionMixin:
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
 
+        # Group conversations should not receive operational lifecycle chatter.
+        chat_type = str(getattr(event.source, "chat_type", "") or "").lower()
+        chat_id = str(getattr(event.source, "chat_id", "") or "")
+        if event.source.platform == Platform.WHATSAPP and (
+            chat_type == "group" or chat_id.endswith("@g.us")
+        ):
+            logger.debug("Busy ack suppressed for WhatsApp group session %s", session_key)
+            return True
+
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.
         if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":

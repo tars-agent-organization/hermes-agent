@@ -173,6 +173,16 @@ def run_tool_round(
         failed = True
         return _verdict("break")
 
+    foreground_guard = getattr(agent, "_foreground_budget_guard", None)
+    consume_handoff_ack = getattr(foreground_guard, "consume_strict_handoff_ack", None)
+    handoff_ack = consume_handoff_ack() if callable(consume_handoff_ack) else None
+    if handoff_ack:
+        _turn_exit_reason = "strict_background_handoff"
+        final_response = handoff_ack
+        append_message(messages, {"role": "assistant", "content": final_response})
+        agent._session_messages = messages
+        return _verdict("break")
+
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
         _turn_exit_reason = "guardrail_halt"

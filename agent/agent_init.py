@@ -2476,6 +2476,12 @@ def init_agent(
         _agent_cfg = {}
 
     _apply_display_config(agent, _agent_cfg, platform)
+    from agent.foreground_budget import foreground_budget_guard_from_config
+    agent._foreground_budget_guard = foreground_budget_guard_from_config(
+        _agent_cfg,
+        gateway_session_key=gateway_session_key,
+        platform=platform,
+    )
     _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
     _apply_agent_section(agent, _agent_cfg)
     cs = _parse_compression_config(agent, _agent_cfg)

@@ -346,13 +346,37 @@ class GatewayConfigLoadersMixin:
         return name or None
 
     def _effective_busy_mode(self, source: SessionSource, attr: str) -> str:
-        """Busy mode from the routed profile snapshot (``attr``: ``_busy_input_mode`` / ``_busy_text_mode``)."""
+        """Busy mode from the routed profile, with an optional platform override."""
         fallback = getattr(self, attr, "interrupt")
         profile_name = self._busy_profile_name_for_source(source)
-        if not profile_name:
-            return fallback
-        modes = getattr(self, attr + "s_by_profile", None)
-        return modes.get(profile_name, fallback) if isinstance(modes, dict) else fallback
+        if profile_name:
+            modes = getattr(self, attr + "s_by_profile", None)
+            if isinstance(modes, dict):
+                fallback = modes.get(profile_name, fallback)
+        try:
+            from gateway.run import _load_gateway_config
+
+            config = (
+                getattr(self, "_profile_configs", {}).get(profile_name)
+                if profile_name else _load_gateway_config()
+            ) or {}
+            platform = getattr(getattr(source, "platform", None), "value", source.platform)
+            platform_cfg = cfg_get(
+                config, "display", "platforms", str(platform or "").strip().lower(), default={}
+            )
+            if isinstance(platform_cfg, dict):
+                key = "busy_input_mode" if attr == "_busy_input_mode" else "busy_text_mode"
+                raw = str(platform_cfg.get(key, "") or "").strip().lower()
+                allowed = _BUSY_INPUT_MODES if key == "busy_input_mode" else {"interrupt", "queue"}
+                if raw in allowed:
+                    return raw
+                if key == "busy_text_mode":
+                    inherited = str(platform_cfg.get("busy_input_mode", "") or "").strip().lower()
+                    if inherited in _BUSY_INPUT_MODES:
+                        return "queue" if inherited == "queue" else "interrupt"
+        except Exception:
+            logger.debug("Could not resolve platform-scoped busy mode", exc_info=True)
+        return fallback
 
     def _effective_busy_input_mode(self, source: SessionSource) -> str:
         """Resolve busy input mode from the routed profile startup snapshot."""
@@ -467,7 +491,7 @@ class GatewayConfigLoadersMixin:
         return DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT
 
     @staticmethod
-    def _load_background_notifications_mode() -> str:
+    def _load_background_notifications_mode(platform_name: str = "") -> str:
         """Background process notification mode from env/config (default ``concise``), resolved for
         the AMBIENT profile — callers deciding for another profile's event enter its scope first
         (``_completion_event_scope``). The env override reads through the secret scope so a served
@@ -476,7 +500,18 @@ class GatewayConfigLoadersMixin:
         from gateway.platforms._shared import platform_gate_env as _platform_gate_env
         mode = _platform_gate_env("HERMES_BACKGROUND_NOTIFICATIONS")
         if not mode:
-            raw = cfg_get(_load_gateway_config(), "display", "background_process_notifications")
+            cfg = _load_gateway_config()
+            if platform_name:
+                from gateway.display_config import resolve_display_setting
+
+                raw = resolve_display_setting(
+                    cfg,
+                    str(platform_name).strip().lower(),
+                    "background_process_notifications",
+                    "concise",
+                )
+            else:
+                raw = cfg_get(cfg, "display", "background_process_notifications")
             if raw is False:
                 mode = "off"
             elif raw not in {None, ""}:

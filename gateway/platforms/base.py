@@ -1860,12 +1860,11 @@ MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "Ephemer
 
 
 def resolve_channel_prompt(config_extra: dict, channel_id: str, parent_id: str | None = None) -> str | None:
-    """Per-channel ephemeral prompt from ``config.extra["channel_prompts"]``: exact *channel_id*
-    first, then *parent_id* (threads inherit the parent prompt). Blank prompts count as absent."""
+    """Per-channel ephemeral prompt: exact id, parent id, then ``*`` fallback."""
     prompts = config_extra.get("channel_prompts") or {}
     if not isinstance(prompts, dict):
         return None
-    for key in (channel_id, parent_id):
+    for key in (channel_id, parent_id, "*"):
         prompt = prompts.get(key) if key else None
         if prompt is not None and (prompt := str(prompt).strip()):
             return prompt
