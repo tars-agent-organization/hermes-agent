@@ -20,7 +20,8 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - PUT/DELETE /v1/push/devices/{installation_id} — manage an APNs device
-- POST /v1/push/devices/{installation_id}/test — send a privacy-safe test push
+- POST /v1/push/devices/{installation_id}/test — send an encrypted speech test
+- POST /v1/push/devices/{installation_id}/speak — send encrypted text-to-speech
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -1681,6 +1682,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "realtime_voice": False,
                 "push_device_registration": True,
                 "push_delivery_configured": self._apns_delivery_configured(),
+                "push_speech_encrypted": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -1707,6 +1709,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "push_test": {
                     "method": "POST",
                     "path": "/v1/push/devices/{installation_id}/test",
+                },
+                "push_speak": {
+                    "method": "POST",
+                    "path": "/v1/push/devices/{installation_id}/speak",
                 },
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -4343,6 +4349,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "invalid_installation_id": "Invalid push installation id.",
             "invalid_device_token": "Invalid APNs device token.",
             "invalid_apns_environment": "APNs environment must be sandbox or production.",
+            "invalid_speech_encryption_key": "Speech encryption key must contain 32 bytes.",
         }
         return web.json_response(
             _openai_error(messages.get(code, "Invalid push registration."), code=code),
@@ -4366,6 +4373,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request.match_info.get("installation_id"),
                 body.get("token"),
                 body.get("environment"),
+                body.get("speech_encryption_key"),
             )
         except ValueError as exc:
             return self._push_validation_response(str(exc))
@@ -4416,6 +4424,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 installation_id,
                 "run.completed",
                 f"test_{uuid.uuid4().hex}",
+                speech_text="Teste de voz do TARS concluído.",
+                require_speech=True,
             )
         except ValueError as exc:
             return self._push_validation_response(str(exc))
@@ -4426,6 +4436,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 code, status = "push_not_configured", 503
             elif isinstance(exc, APNSDeliveryError) and exc.reason == "device_not_registered":
                 code, status = "push_device_not_registered", 404
+            elif isinstance(exc, APNSDeliveryError) and exc.reason == "speech_not_registered":
+                code, status = "push_speech_not_registered", 409
             else:
                 code, status = "push_delivery_failed", 502
             logger.warning("[api_server] APNs test failed: %s", code)
@@ -4439,19 +4451,80 @@ class APIServerAdapter(BasePlatformAdapter):
             "apns_id": apns_id,
         })
 
+    async def _handle_speak_push_device(self, request: "web.Request") -> "web.Response":
+        """Send arbitrary TARS speech encrypted for one registered iPhone."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("JSON body must be an object"), status=400)
+        text = str(body.get("text") or "").strip()
+        if not text or len(text.encode("utf-8")) > 16_000:
+            return web.json_response(
+                _openai_error(
+                    "Speech text must contain between 1 and 16000 UTF-8 bytes.",
+                    code="invalid_speech_text",
+                ),
+                status=400,
+            )
+        run_id = f"speech_{uuid.uuid4().hex}"
+        installation_id = request.match_info.get("installation_id")
+        try:
+            apns_id = await self._apns_service().send(
+                installation_id,
+                "run.completed",
+                run_id,
+                speech_text=text,
+                require_speech=True,
+            )
+        except ValueError as exc:
+            return self._push_validation_response(str(exc))
+        except Exception as exc:
+            from gateway.apns import APNSConfigurationError, APNSDeliveryError
+
+            if isinstance(exc, APNSConfigurationError):
+                code, status = "push_not_configured", 503
+            elif isinstance(exc, APNSDeliveryError) and exc.reason == "device_not_registered":
+                code, status = "push_device_not_registered", 404
+            elif isinstance(exc, APNSDeliveryError) and exc.reason == "speech_not_registered":
+                code, status = "push_speech_not_registered", 409
+            else:
+                code, status = "push_delivery_failed", 502
+            logger.warning("[api_server] encrypted speech push failed: %s", code)
+            return web.json_response(
+                _openai_error("Speech push could not be delivered.", code=code),
+                status=status,
+            )
+        return web.json_response({
+            "object": "hermes.push.speech",
+            "status": "accepted",
+            "run_id": run_id,
+            "apns_id": apns_id,
+        })
+
     def _schedule_run_push(
         self,
         *,
         installation_id: Optional[str],
         event: str,
         run_id: str,
+        speech_text: Any = None,
     ) -> None:
         if not installation_id:
             return
 
         async def _deliver() -> None:
             try:
-                await self._apns_service().send(installation_id, event, run_id)
+                await self._apns_service().send(
+                    installation_id,
+                    event,
+                    run_id,
+                    speech_text=speech_text,
+                )
             except Exception as exc:
                 reason = getattr(exc, "reason", type(exc).__name__)
                 logger.warning(
@@ -4856,6 +4929,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         installation_id=notification_device_id,
                         event="run.completed",
                         run_id=run_id,
+                        speech_text=final_response,
                     )
             except asyncio.CancelledError:
                 self._set_run_status(
@@ -5276,6 +5350,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post(
                 "/v1/push/devices/{installation_id}/test",
                 self._handle_test_push_device,
+            )
+            self._app.router.add_post(
+                "/v1/push/devices/{installation_id}/speak",
+                self._handle_speak_push_device,
             )
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
