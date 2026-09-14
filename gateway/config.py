@@ -1469,7 +1469,7 @@ def load_gateway_config() -> GatewayConfig:
                     _merge_platform_map(_nested_platforms)
 
             # Bridge api_server-specific keys (port, key, host, cors_origins,
-            # model_name) into extra so PlatformConfig.from_dict preserves
+            # model_name, apns) into extra so PlatformConfig.from_dict preserves
             # them — adapting what _apply_env_overrides does for env vars to
             # the YAML path.  Users writing ``gateway.api_server.port: 8642``
             # expect these to end up in the platform's extra dict.
@@ -1479,7 +1479,7 @@ def load_gateway_config() -> GatewayConfig:
                 if not isinstance(_api_extra, dict):
                     _api_extra = {}
                     _api_plat["extra"] = _api_extra
-                for _bridge_key in ("port", "key", "host", "cors_origins", "model_name"):
+                for _bridge_key in ("port", "key", "host", "cors_origins", "model_name", "apns"):
                     if _bridge_key in _api_plat and _bridge_key not in _api_extra:
                         _api_extra[_bridge_key] = _api_plat.pop(_bridge_key)
 

@@ -571,9 +571,22 @@ gateway:
     cors_origins: http://localhost:3000
     model_name: my-hermes
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
+    apns:
+      enabled: true
+      team_id: YOUR_APPLE_TEAM_ID
+      key_id: YOUR_APNS_KEY_ID
+      topic: local.tars.MetaWearablesPhase0
 ```
 
-`port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+`port`, `key`, `host`, `cors_origins`, `model_name`, and `apns` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+
+APNs lets a first-party iOS client register a device and ask `/v1/runs` for a
+notification when a command completes, fails, or needs approval. Keep the APNs
+private key out of YAML: inject the `.p8` value with `APNS_AUTH_KEY`, or inject a
+secret-scoped file path with `APNS_AUTH_KEY_PATH`. Push payloads contain only the
+event type and `run_id`; the authenticated app fetches the actual response from
+Hermes, so prompts and personal or health results do not pass through APNs or
+appear on the lock screen.
 
 ### Concurrent-run cap
 
