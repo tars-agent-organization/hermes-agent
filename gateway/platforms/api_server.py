@@ -19,6 +19,8 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- PUT/DELETE /v1/push/devices/{installation_id} — manage an APNs device
+- POST /v1/push/devices/{installation_id}/test — send a privacy-safe test push
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -943,6 +945,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(
             extra.get("model_routes"),
         )
+        raw_apns = extra.get("apns")
+        self._apns_config: Dict[str, Any] = (
+            dict(raw_apns) if isinstance(raw_apns, dict) else {}
+        )
+        self._apns_service_cache: Optional[Any] = None
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1672,6 +1679,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills_api": True,
                 "audio_api": False,
                 "realtime_voice": False,
+                "push_device_registration": True,
+                "push_delivery_configured": self._apns_delivery_configured(),
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -1687,6 +1696,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "push_device": {
+                    "method": "PUT",
+                    "path": "/v1/push/devices/{installation_id}",
+                },
+                "push_device_delete": {
+                    "method": "DELETE",
+                    "path": "/v1/push/devices/{installation_id}",
+                },
+                "push_test": {
+                    "method": "POST",
+                    "path": "/v1/push/devices/{installation_id}/test",
+                },
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -4274,6 +4295,179 @@ class APIServerAdapter(BasePlatformAdapter):
             self._inflight_agent_runs -= 1
 
     # ------------------------------------------------------------------
+    # APNs device registration and privacy-safe run notifications
+    # ------------------------------------------------------------------
+
+    def _apns_settings(self):
+        """Resolve non-secret config plus the scoped APNs private key."""
+        from agent.secret_scope import get_secret
+        from gateway.apns import APNSSettings
+
+        key = str(get_secret("APNS_AUTH_KEY", "") or "").strip()
+        if key and "\\n" in key and "\n" not in key:
+            key = key.replace("\\n", "\n")
+        if not key:
+            key_path = str(get_secret("APNS_AUTH_KEY_PATH", "") or "").strip()
+            if key_path:
+                try:
+                    key = Path(key_path).expanduser().read_text(encoding="utf-8")
+                except OSError:
+                    key = ""
+        return APNSSettings(
+            enabled=_coerce_request_bool(self._apns_config.get("enabled"), default=False),
+            team_id=str(self._apns_config.get("team_id") or "").strip(),
+            key_id=str(self._apns_config.get("key_id") or "").strip(),
+            topic=str(self._apns_config.get("topic") or "").strip(),
+            auth_key=key,
+        )
+
+    def _apns_service(self):
+        from gateway.apns import APNSDeviceStore, APNSPushService
+
+        settings = self._apns_settings()
+        service = self._apns_service_cache
+        if service is None or service.settings != settings:
+            service = APNSPushService(settings, APNSDeviceStore())
+            self._apns_service_cache = service
+        return service
+
+    def _apns_delivery_configured(self) -> bool:
+        try:
+            return bool(self._apns_settings().configured)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _push_validation_response(code: str) -> "web.Response":
+        messages = {
+            "invalid_installation_id": "Invalid push installation id.",
+            "invalid_device_token": "Invalid APNs device token.",
+            "invalid_apns_environment": "APNs environment must be sandbox or production.",
+        }
+        return web.json_response(
+            _openai_error(messages.get(code, "Invalid push registration."), code=code),
+            status=400,
+        )
+
+    async def _handle_register_push_device(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("JSON body must be an object"), status=400)
+
+        try:
+            service = self._apns_service()
+            device = service.store.register(
+                request.match_info.get("installation_id"),
+                body.get("token"),
+                body.get("environment"),
+            )
+        except ValueError as exc:
+            return self._push_validation_response(str(exc))
+        except Exception:
+            logger.exception("[api_server] failed to register APNs device")
+            return web.json_response(
+                _openai_error("Failed to register push device.", code="push_registration_failed"),
+                status=500,
+            )
+
+        return web.json_response({
+            "object": "hermes.push.device",
+            "installation_id": device.installation_id,
+            "environment": device.environment,
+            "status": "registered",
+            "delivery_configured": service.settings.configured,
+            "updated_at": device.updated_at,
+        })
+
+    async def _handle_delete_push_device(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            deleted = self._apns_service().store.delete(
+                request.match_info.get("installation_id")
+            )
+        except ValueError as exc:
+            return self._push_validation_response(str(exc))
+        except Exception:
+            logger.exception("[api_server] failed to delete APNs device")
+            return web.json_response(
+                _openai_error("Failed to delete push device.", code="push_delete_failed"),
+                status=500,
+            )
+        return web.json_response({
+            "object": "hermes.push.device.deleted",
+            "deleted": deleted,
+        })
+
+    async def _handle_test_push_device(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        installation_id = request.match_info.get("installation_id")
+        try:
+            apns_id = await self._apns_service().send(
+                installation_id,
+                "run.completed",
+                f"test_{uuid.uuid4().hex}",
+            )
+        except ValueError as exc:
+            return self._push_validation_response(str(exc))
+        except Exception as exc:
+            from gateway.apns import APNSConfigurationError, APNSDeliveryError
+
+            if isinstance(exc, APNSConfigurationError):
+                code, status = "push_not_configured", 503
+            elif isinstance(exc, APNSDeliveryError) and exc.reason == "device_not_registered":
+                code, status = "push_device_not_registered", 404
+            else:
+                code, status = "push_delivery_failed", 502
+            logger.warning("[api_server] APNs test failed: %s", code)
+            return web.json_response(
+                _openai_error("Push could not be delivered.", code=code),
+                status=status,
+            )
+        return web.json_response({
+            "object": "hermes.push.delivery",
+            "status": "accepted",
+            "apns_id": apns_id,
+        })
+
+    def _schedule_run_push(
+        self,
+        *,
+        installation_id: Optional[str],
+        event: str,
+        run_id: str,
+    ) -> None:
+        if not installation_id:
+            return
+
+        async def _deliver() -> None:
+            try:
+                await self._apns_service().send(installation_id, event, run_id)
+            except Exception as exc:
+                reason = getattr(exc, "reason", type(exc).__name__)
+                logger.warning(
+                    "[api_server] APNs delivery failed for run=%s reason=%s",
+                    run_id,
+                    reason,
+                )
+
+        task = asyncio.create_task(_deliver())
+        try:
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except (AttributeError, TypeError):
+            pass
+
+    # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
     # ------------------------------------------------------------------
 
@@ -4359,6 +4553,38 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("JSON body must be an object"), status=400)
+
+        notification_device_id: Optional[str] = None
+        raw_notification_device_id = body.get("notification_device_id")
+        if raw_notification_device_id is not None:
+            try:
+                service = self._apns_service()
+                notification_device_id = service.store.validate_installation_id(
+                    raw_notification_device_id
+                )
+                device = service.store.get(notification_device_id)
+            except ValueError as exc:
+                return self._push_validation_response(str(exc))
+            except Exception:
+                logger.exception("[api_server] failed to resolve APNs device for run")
+                return web.json_response(
+                    _openai_error(
+                        "Failed to resolve push device.",
+                        code="push_device_lookup_failed",
+                    ),
+                    status=500,
+                )
+            if device is None or not device.enabled:
+                return web.json_response(
+                    _openai_error(
+                        "Push device is not registered.",
+                        code="push_device_not_registered",
+                    ),
+                    status=400,
+                )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -4518,6 +4744,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         loop.call_soon_threadsafe(q.put_nowait, event)
                     except Exception:
                         pass
+                    try:
+                        loop.call_soon_threadsafe(
+                            lambda: self._schedule_run_push(
+                                installation_id=notification_device_id,
+                                event="approval.request",
+                                run_id=run_id,
+                            )
+                        )
+                    except Exception:
+                        pass
 
                 def _run_sync():
                     from gateway.session_context import clear_session_vars
@@ -4595,6 +4831,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         error=error_msg,
                         last_event="run.failed",
                     )
+                    self._schedule_run_push(
+                        installation_id=notification_device_id,
+                        event="run.failed",
+                        run_id=run_id,
+                    )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     _put_event_if_active({
@@ -4610,6 +4851,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         output=final_response,
                         usage=usage,
                         last_event="run.completed",
+                    )
+                    self._schedule_run_push(
+                        installation_id=notification_device_id,
+                        event="run.completed",
+                        run_id=run_id,
                     )
             except asyncio.CancelledError:
                 self._set_run_status(
@@ -4643,6 +4889,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                self._schedule_run_push(
+                    installation_id=notification_device_id,
+                    event="run.failed",
+                    run_id=run_id,
+                )
             finally:
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
@@ -5014,6 +5265,18 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_put(
+                "/v1/push/devices/{installation_id}",
+                self._handle_register_push_device,
+            )
+            self._app.router.add_delete(
+                "/v1/push/devices/{installation_id}",
+                self._handle_delete_push_device,
+            )
+            self._app.router.add_post(
+                "/v1/push/devices/{installation_id}/test",
+                self._handle_test_push_device,
+            )
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
