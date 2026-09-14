@@ -14,6 +14,7 @@ import hashlib
 import json
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -208,6 +209,46 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_registered_client_can_request_completion_push(self, adapter):
+        app = _create_runs_app(adapter)
+        service = SimpleNamespace(store=MagicMock())
+        service.store.validate_installation_id.return_value = "ios-installation-1234"
+        service.store.get.return_value = SimpleNamespace(enabled=True)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_apns_service", return_value=service),
+                patch.object(adapter, "_schedule_run_push") as schedule_push,
+                patch.object(adapter, "_create_agent") as mock_create,
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "private answer"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "notification_device_id": "ios-installation-1234",
+                    },
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    if schedule_push.called:
+                        break
+                    await asyncio.sleep(0.05)
+
+        schedule_push.assert_called_once_with(
+            installation_id="ios-installation-1234",
+            event="run.completed",
+            run_id=run_id,
+        )
+
     @pytest.mark.asyncio
     async def test_room_auth_is_validated_before_body_parse_or_work_reservation(
         self, auth_adapter

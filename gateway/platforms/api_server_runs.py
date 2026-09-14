@@ -501,6 +501,7 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    notification_device_id: Optional[str] = None
 
     @property
     def approval_session_key(self) -> str:
@@ -631,6 +632,27 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
+    if not isinstance(body, dict):
+        return _json_error(_openai_error, "JSON body must be an object", status=400)
+    notification_device_id: Optional[str] = None
+    raw_notification_device_id = body.get("notification_device_id")
+    if raw_notification_device_id is not None:
+        try:
+            service = self._apns_service()
+            notification_device_id = service.store.validate_installation_id(
+                raw_notification_device_id)
+            device = service.store.get(notification_device_id)
+        except ValueError as exc:
+            return self._push_validation_response(str(exc))
+        except Exception:
+            logger.exception("[api_server] failed to resolve APNs device for run")
+            return _json_error(
+                _openai_error, "Failed to resolve push device.",
+                code="push_device_lookup_failed", status=500)
+        if device is None or not device.enabled:
+            return _json_error(
+                _openai_error, "Push device is not registered.",
+                code="push_device_not_registered", status=400)
     room_dispatch, room_execution_policy = (
         v if isinstance(v, dict) else None for v in (
             (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
@@ -738,7 +760,8 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author)
+        turn_author=turn_author,
+        notification_device_id=notification_device_id)
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
@@ -857,6 +880,11 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[di
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
             loop.call_soon_threadsafe(q.put_nowait, event)
+        with suppress(Exception):
+            loop.call_soon_threadsafe(lambda: self._schedule_run_push(
+                installation_id=run.notification_device_id,
+                event="approval.request",
+                run_id=run_id))
 
     return _approval_notify
 
@@ -883,6 +911,10 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}")
         with suppress(Exception):
             run.put_event(_run_event(run_id, f"run.{status}", **fields))
+        push_event = "run.completed" if status == "completed" else "run.failed" if status == "failed" else None
+        if push_event:
+            self._schedule_run_push(
+                installation_id=run.notification_device_id, event=push_event, run_id=run_id)
 
     try:
         self._set_run_status(run_id, "running", delivery_id=delivery_id)
@@ -946,6 +978,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             # A worker can finish before its Future is wrapped, so awaiting it
             # need not yield to already-scheduled commentary/tool callbacks.
             loop.call_soon(run.put_event, _run_event(run_id, f"run.{status}", **fields, **extra))
+        push_event = "run.completed" if status == "completed" else "run.failed" if status == "failed" else None
+        if push_event:
+            self._schedule_run_push(
+                installation_id=run.notification_device_id, event=push_event, run_id=run_id)
 
     try:
         # Shutdown landed between admission and the task's first tick: nothing to

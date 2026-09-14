@@ -73,6 +73,7 @@ _STATIC_FEATURE_FLAGS = {
     "reasoning_streaming": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
+    "push_device_registration": True,
     "session_continuity_header": "X-Hermes-Session-Id",
     "session_key_header": "X-Hermes-Session-Key"}
 # /v1/capabilities "endpoints" table: name -> (method, path).
@@ -85,7 +86,11 @@ _CAPABILITY_ENDPOINTS = (
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
-    ("run_stop", ("POST", "/v1/runs/{run_id}/stop")), ("skills", ("GET", "/v1/skills")),
+    ("run_stop", ("POST", "/v1/runs/{run_id}/stop")),
+    ("push_device", ("PUT", "/v1/push/devices/{installation_id}")),
+    ("push_device_delete", ("DELETE", "/v1/push/devices/{installation_id}")),
+    ("push_test", ("POST", "/v1/push/devices/{installation_id}/test")),
+    ("skills", ("GET", "/v1/skills")),
     ("toolsets", ("GET", "/v1/toolsets")), ("sessions", ("GET", "/api/sessions")),
     ("session_create", ("POST", "/api/sessions")),
     ("session", ("GET", "/api/sessions/{session_id}")),
@@ -1200,6 +1205,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             extra.get("model_name", _get_scoped_secret("API_SERVER_MODEL_NAME", "")))
         # alias (client "model") -> {model, provider?, api_key? (UPSTREAM, never logged), base_url?}
         self._model_routes: dict[str, dict[str, Any]] = self._parse_model_routes(extra.get("model_routes"))
+        raw_apns = extra.get("apns")
+        self._apns_config: dict[str, Any] = dict(raw_apns) if isinstance(raw_apns, dict) else {}
+        # Profile-scoped homes must never share a device registry or provider-token cache.
+        self._apns_service_cache: dict[str, Any] = {}
         # Opt-in bare ``model`` passthrough on OpenAI-compatible surfaces (generic clients
         # hardcode "gpt-4o" etc., hence off by default).
         # Off by default: generic OpenAI clients routinely hardcode model names ("gpt-4o", ...), and
@@ -1757,7 +1766,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
-            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
+            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("PUT", "/v1/push/devices/{installation_id}", self._handle_register_push_device),
+            ("DELETE", "/v1/push/devices/{installation_id}", self._handle_delete_push_device),
+            ("POST", "/v1/push/devices/{installation_id}/test", self._handle_test_push_device)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
@@ -2508,6 +2520,143 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("[%s] GET /api/model/options failed", self.name)
             return _error_response("Failed to list model options.", 500, code="model_options_failed")
 
+    def _apns_settings(self):
+        """Resolve profile-scoped APNs credentials without exposing them in API responses."""
+        from gateway.apns import APNSSettings
+
+        key = str(_get_scoped_secret("APNS_AUTH_KEY", "") or "").strip()
+        if key and "\\n" in key and "\n" not in key:
+            key = key.replace("\\n", "\n")
+        if not key:
+            key_path = str(_get_scoped_secret("APNS_AUTH_KEY_PATH", "") or "").strip()
+            if key_path:
+                try:
+                    key = Path(key_path).expanduser().read_text(encoding="utf-8")
+                except OSError:
+                    key = ""
+        return APNSSettings(
+            enabled=_coerce_request_bool(self._apns_config.get("enabled"), default=False),
+            team_id=str(self._apns_config.get("team_id") or "").strip(),
+            key_id=str(self._apns_config.get("key_id") or "").strip(),
+            topic=str(self._apns_config.get("topic") or "").strip(),
+            auth_key=key,
+        )
+
+    def _apns_service(self):
+        from gateway.apns import APNSDeviceStore, APNSPushService
+        from hermes_constants import get_hermes_home
+
+        settings = self._apns_settings()
+        cache_key = str(get_hermes_home().resolve())
+        service = self._apns_service_cache.get(cache_key)
+        if service is None or service.settings != settings:
+            service = APNSPushService(settings, APNSDeviceStore())
+            self._apns_service_cache[cache_key] = service
+        return service
+
+    def _apns_delivery_configured(self) -> bool:
+        try:
+            return bool(self._apns_settings().configured)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _push_validation_response(code: str) -> web.Response:
+        messages = {
+            "invalid_installation_id": "Invalid push installation id.",
+            "invalid_device_token": "Invalid APNs device token.",
+            "invalid_apns_environment": "APNs environment must be sandbox or production.",
+        }
+        return web.json_response(
+            _openai_error(messages.get(code, "Invalid push registration."), code=code),
+            status=400,
+        )
+
+    async def _handle_register_push_device(self, request: web.Request) -> web.Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("JSON body must be an object"), status=400)
+        try:
+            service = self._apns_service()
+            device = service.store.register(
+                request.match_info.get("installation_id"), body.get("token"), body.get("environment"))
+        except ValueError as exc:
+            return self._push_validation_response(str(exc))
+        except Exception:
+            logger.exception("[api_server] failed to register APNs device")
+            return web.json_response(
+                _openai_error("Failed to register push device.", code="push_registration_failed"),
+                status=500,
+            )
+        return web.json_response({
+            "object": "hermes.push.device",
+            "installation_id": device.installation_id,
+            "environment": device.environment,
+            "status": "registered",
+            "delivery_configured": service.settings.configured,
+            "updated_at": device.updated_at,
+        })
+
+    async def _handle_delete_push_device(self, request: web.Request) -> web.Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            deleted = self._apns_service().store.delete(request.match_info.get("installation_id"))
+        except ValueError as exc:
+            return self._push_validation_response(str(exc))
+        except Exception:
+            logger.exception("[api_server] failed to delete APNs device")
+            return web.json_response(
+                _openai_error("Failed to delete push device.", code="push_delete_failed"), status=500)
+        return web.json_response({"object": "hermes.push.device.deleted", "deleted": deleted})
+
+    async def _handle_test_push_device(self, request: web.Request) -> web.Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            apns_id = await self._apns_service().send(
+                request.match_info.get("installation_id"), "run.completed", f"test_{uuid.uuid4().hex}")
+        except ValueError as exc:
+            return self._push_validation_response(str(exc))
+        except Exception as exc:
+            from gateway.apns import APNSConfigurationError, APNSDeliveryError
+
+            if isinstance(exc, APNSConfigurationError):
+                code, status = "push_not_configured", 503
+            elif isinstance(exc, APNSDeliveryError) and exc.reason == "device_not_registered":
+                code, status = "push_device_not_registered", 404
+            else:
+                code, status = "push_delivery_failed", 502
+            logger.warning("[api_server] APNs test failed: %s", code)
+            return web.json_response(
+                _openai_error("Push could not be delivered.", code=code), status=status)
+        return web.json_response({
+            "object": "hermes.push.delivery", "status": "accepted", "apns_id": apns_id})
+
+    def _schedule_run_push(
+        self, *, installation_id: Optional[str], event: str, run_id: str
+    ) -> None:
+        if not installation_id:
+            return
+
+        async def _deliver() -> None:
+            try:
+                await self._apns_service().send(installation_id, event, run_id)
+            except Exception as exc:
+                logger.warning(
+                    "[api_server] APNs delivery failed for run=%s reason=%s",
+                    run_id, getattr(exc, "reason", type(exc).__name__))
+
+        self._track_background_task(asyncio.create_task(_deliver()), tolerate_missing=True)
+
     @_require_auth
     async def _handle_capabilities(self, request: web.Request) -> web.Response:
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
@@ -2526,6 +2675,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
                 **_STATIC_FEATURE_FLAGS,
+                "push_delivery_configured": self._apns_delivery_configured(),
                 "cors": bool(self._cors_origins),
                 # Always advertised for feature-detection; enabled follows config.
                 "browser_extension_control": {
