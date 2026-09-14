@@ -914,7 +914,8 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[
         push_event = "run.completed" if status == "completed" else "run.failed" if status == "failed" else None
         if push_event:
             self._schedule_run_push(
-                installation_id=run.notification_device_id, event=push_event, run_id=run_id)
+                installation_id=run.notification_device_id, event=push_event, run_id=run_id,
+                speech_text=fields.get("output") if push_event == "run.completed" else None)
 
     try:
         self._set_run_status(run_id, "running", delivery_id=delivery_id)
@@ -981,7 +982,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         push_event = "run.completed" if status == "completed" else "run.failed" if status == "failed" else None
         if push_event:
             self._schedule_run_push(
-                installation_id=run.notification_device_id, event=push_event, run_id=run_id)
+                installation_id=run.notification_device_id, event=push_event, run_id=run_id,
+                speech_text=fields.get("output") if push_event == "run.completed" else None)
 
     try:
         # Shutdown landed between admission and the task's first tick: nothing to

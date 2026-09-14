@@ -247,6 +247,7 @@ class TestStartRun:
             installation_id="ios-installation-1234",
             event="run.completed",
             run_id=run_id,
+            speech_text="private answer",
         )
 
     @pytest.mark.asyncio
