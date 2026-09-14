@@ -160,6 +160,7 @@ class TestStartRun:
             event="run.completed",
             run_id=run_id,
             request_profile=None,
+            speech_text="private answer",
         )
 
     @pytest.mark.asyncio
