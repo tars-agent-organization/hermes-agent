@@ -74,6 +74,7 @@ _STATIC_FEATURE_FLAGS = {
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
     "push_device_registration": True, "push_speech_encrypted": True,
+    "meeting_transcript_ingest": True,
     "session_continuity_header": "X-Hermes-Session-Id",
     "session_key_header": "X-Hermes-Session-Key"}
 # /v1/capabilities "endpoints" table: name -> (method, path).
@@ -91,6 +92,7 @@ _CAPABILITY_ENDPOINTS = (
     ("push_device_delete", ("DELETE", "/v1/push/devices/{installation_id}")),
     ("push_test", ("POST", "/v1/push/devices/{installation_id}/test")),
     ("push_speak", ("POST", "/v1/push/devices/{installation_id}/speak")),
+    ("meeting_recordings", ("POST", "/v1/meeting-recordings")),
     ("skills", ("GET", "/v1/skills")),
     ("toolsets", ("GET", "/v1/toolsets")), ("sessions", ("GET", "/api/sessions")),
     ("session_create", ("POST", "/api/sessions")),
@@ -1210,6 +1212,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._apns_config: dict[str, Any] = dict(raw_apns) if isinstance(raw_apns, dict) else {}
         # Profile-scoped homes must never share a device registry or provider-token cache.
         self._apns_service_cache: dict[str, Any] = {}
+        self._meeting_recording_store_cache: dict[str, Any] = {}
         # Opt-in bare ``model`` passthrough on OpenAI-compatible surfaces (generic clients
         # hardcode "gpt-4o" etc., hence off by default).
         # Off by default: generic OpenAI clients routinely hardcode model names ("gpt-4o", ...), and
@@ -1773,6 +1776,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/v1/push/devices/{installation_id}/test", self._handle_test_push_device)]
         routes.append(
             ("POST", "/v1/push/devices/{installation_id}/speak", self._handle_speak_push_device))
+        routes.append(("POST", "/v1/meeting-recordings", self._handle_meeting_recording))
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
@@ -2562,6 +2566,50 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return bool(self._apns_settings().configured)
         except Exception:
             return False
+
+    def _meeting_recording_store(self):
+        """Return the transcript inbox rooted in the active Hermes profile."""
+        from gateway.meeting_recordings import MeetingRecordingStore
+        from hermes_constants import get_hermes_home
+
+        cache_key = str(get_hermes_home().resolve())
+        store = self._meeting_recording_store_cache.get(cache_key)
+        if store is None:
+            store = MeetingRecordingStore()
+            self._meeting_recording_store_cache[cache_key] = store
+        return store
+
+    async def _handle_meeting_recording(self, request: web.Request) -> web.Response:
+        """Persist a private transcript before its client deletes raw audio."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        try:
+            recording, created = self._meeting_recording_store().save(body)
+        except ValueError as exc:
+            code = str(exc)
+            return web.json_response(
+                _openai_error("Invalid meeting transcript.", code=code),
+                status=409 if code == "meeting_recording_conflict" else 400,
+            )
+        except Exception:
+            logger.exception("[api_server] failed to persist meeting transcript")
+            return web.json_response(
+                _openai_error(
+                    "Failed to persist meeting transcript.",
+                    code="meeting_recording_write_failed"),
+                status=500,
+            )
+        return web.json_response({
+            "object": "hermes.meeting_recording",
+            "recording_id": recording.recording_id,
+            "persisted": True,
+            "created_at": recording.created_at,
+        }, status=201 if created else 200)
 
     @staticmethod
     def _push_validation_response(code: str) -> web.Response:
