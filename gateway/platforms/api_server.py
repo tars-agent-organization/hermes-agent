@@ -22,6 +22,7 @@ Exposes an HTTP server with endpoints:
 - PUT/DELETE /v1/push/devices/{installation_id} — manage an APNs device
 - POST /v1/push/devices/{installation_id}/test — send an encrypted speech test
 - POST /v1/push/devices/{installation_id}/speak — send encrypted text-to-speech
+- POST /v1/meeting-recordings     — durably ingest an on-device transcript
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -951,6 +952,7 @@ class APIServerAdapter(BasePlatformAdapter):
             dict(raw_apns) if isinstance(raw_apns, dict) else {}
         )
         self._apns_service_cache: Optional[Any] = None
+        self._meeting_recording_store_cache: Optional[Any] = None
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1683,6 +1685,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "push_device_registration": True,
                 "push_delivery_configured": self._apns_delivery_configured(),
                 "push_speech_encrypted": True,
+                "meeting_transcript_ingest": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -1713,6 +1716,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "push_speak": {
                     "method": "POST",
                     "path": "/v1/push/devices/{installation_id}/speak",
+                },
+                "meeting_recordings": {
+                    "method": "POST",
+                    "path": "/v1/meeting-recordings",
                 },
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -4343,6 +4350,55 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    def _meeting_recording_store(self):
+        """Return the transcript inbox rooted in the active Hermes profile."""
+        from gateway.meeting_recordings import MeetingRecordingStore
+
+        store = self._meeting_recording_store_cache
+        if store is None:
+            store = MeetingRecordingStore()
+            self._meeting_recording_store_cache = store
+        return store
+
+    async def _handle_meeting_recording(self, request: "web.Request") -> "web.Response":
+        """Persist a private transcript before its client deletes raw audio."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        try:
+            recording, created = self._meeting_recording_store().save(body)
+        except ValueError as exc:
+            code = str(exc)
+            status = 409 if code == "meeting_recording_conflict" else 400
+            return web.json_response(
+                _openai_error("Invalid meeting transcript.", code=code),
+                status=status,
+            )
+        except Exception:
+            logger.exception("[api_server] failed to persist meeting transcript")
+            return web.json_response(
+                _openai_error(
+                    "Failed to persist meeting transcript.",
+                    code="meeting_recording_write_failed",
+                ),
+                status=500,
+            )
+
+        return web.json_response(
+            {
+                "object": "hermes.meeting_recording",
+                "recording_id": recording.recording_id,
+                "persisted": True,
+                "created_at": recording.created_at,
+            },
+            status=201 if created else 200,
+        )
+
     @staticmethod
     def _push_validation_response(code: str) -> "web.Response":
         messages = {
@@ -5354,6 +5410,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post(
                 "/v1/push/devices/{installation_id}/speak",
                 self._handle_speak_push_device,
+            )
+            self._app.router.add_post(
+                "/v1/meeting-recordings",
+                self._handle_meeting_recording,
             )
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
