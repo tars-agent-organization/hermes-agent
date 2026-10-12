@@ -13,9 +13,11 @@ import contextvars
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
@@ -50,6 +52,48 @@ _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 # A delivery claim older than this is abandoned and may be re-claimed.
 _CLAIM_LEASE_S = 300.0
 _DB_LOCK = threading.Lock()
+_DISPLAY_SECRET = re.compile(r"(?i)\b(?:api[_ -]?key|token|secret|password|passwd|authorization)\s*[=:]")
+_DISPLAY_URL = re.compile(r"(?i)\b(?:https?|wss?)://")
+_DISPLAY_EMAIL = re.compile(r"(?i)\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b")
+_DISPLAY_PHONE = re.compile(r"(?<!\w)\+?\d[\d(). -]{7,}\d(?!\w)")
+_DISPLAY_MARKDOWN_V2 = frozenset("_*[]()~`>#+-=|{}.!\\")
+_DISPLAY_SAFE_ASCII_PUNCTUATION = frozenset(",;:'&/")
+_DEFAULT_DISPLAY_NAME, _DEFAULT_DISPLAY_TASK = "Delegated agent", "Task in progress"
+
+
+def _comparison_text(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split()) if isinstance(value, str) else ""
+
+
+def sanitize_public_display(
+    value: Any, *, fallback: str, limit: int, goal: Any = None, context: Any = None,
+) -> str:
+    """Fail closed to bounded, renderer-neutral public metadata."""
+    if not isinstance(value, str):
+        return fallback
+    text = unicodedata.normalize("NFKC", value)
+    if not text or any(unicodedata.category(c) in {"Cc", "Cf"} for c in text):
+        return fallback
+    if any(c in _DISPLAY_MARKDOWN_V2 for c in text):
+        return fallback
+    if any(not (unicodedata.category(c)[0] in {"L", "M", "N"} or c == " " or c in _DISPLAY_SAFE_ASCII_PUNCTUATION) for c in text):
+        return fallback
+    text = " ".join(text.split())
+    candidate = _comparison_text(text)
+    copied = len(candidate) >= 24 and any(candidate in _comparison_text(src) for src in (goal, context))
+    if (not text or len(text) > limit or _DISPLAY_SECRET.search(text) or _DISPLAY_URL.search(text)
+            or _DISPLAY_EMAIL.search(text) or _DISPLAY_PHONE.search(text) or copied):
+        return fallback
+    return text
+
+
+def normalize_public_display_metadata(
+    display_name: Any = None, display_task: Any = None, *, goal: Any = None, context: Any = None,
+) -> tuple[str, str]:
+    return (
+        sanitize_public_display(display_name, fallback=_DEFAULT_DISPLAY_NAME, limit=48, goal=goal, context=context),
+        sanitize_public_display(display_task, fallback=_DEFAULT_DISPLAY_TASK, limit=96, goal=goal, context=context),
+    )
 
 # ── Orphaned-completion sweep ────────────────────────────────────────────────
 # Startup replay runs once per process, so a completion whose owner died while THIS process was
@@ -159,7 +203,8 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts",
+                    "display_name", "display_task", "display_names", "display_tasks", *_ROUTING_KEYS)
         if key in record}
     try:  # where the children's terminals started; lets recovery add a git-state hint
         task_payload["owner_cwd"] = os.getcwd()
@@ -757,6 +802,8 @@ def _dispatch_admitted(
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     task_indexes: Optional[list[int]] = None,
     task_transcripts: Optional[dict[str, str]] = None,
+    display_name: Any = None, display_task: Any = None,
+    display_names: Any = None, display_tasks: Any = None,
 ) -> dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -769,6 +816,20 @@ def _dispatch_admitted(
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")
     crash_result = _batch_crash if is_batch else _single_crash
     dispatched_at = time.time()
+    public_name, public_task = normalize_public_display_metadata(
+        display_name, display_task, goal=goal, context=context,
+    )
+    raw_names = display_names if isinstance(display_names, list) else []
+    raw_tasks = display_tasks if isinstance(display_tasks, list) else []
+    source_goals = list(goals or [goal])
+    public_batch = [
+        normalize_public_display_metadata(
+            raw_names[i] if i < len(raw_names) else None,
+            raw_tasks[i] if i < len(raw_tasks) else None,
+            goal=source_goal, context=context,
+        )
+        for i, source_goal in enumerate(source_goals)
+    ]
     record: dict[str, Any] = {
         "delegation_id": delegation_id, "goal": goal, **({"goals": list(goals)} if is_batch else {}),
         "context": context, "toolsets": list(toolsets) if toolsets else None, "role": role, "model": model,
@@ -778,6 +839,9 @@ def _dispatch_admitted(
         "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id,
+        "display_name": public_name, "display_task": public_task,
+        **({"display_names": [v[0] for v in public_batch],
+            "display_tasks": [v[1] for v in public_batch]} if is_batch else {}),
         **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
@@ -839,6 +903,7 @@ def dispatch_async_delegation(
     session_key: str, parent_session_id: Optional[str] = None, runner: Callable[[], dict[str, Any]],
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, progress_fn: Optional[Callable[[], tuple]] = None,
+    display_name: Any = None, display_task: Any = None,
 ) -> dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
@@ -852,6 +917,7 @@ def dispatch_async_delegation(
         parent_session_id=parent_session_id, runner=runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn,
+        display_name=display_name, display_task=display_task,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or run this task synchronously (background=false). "
@@ -870,6 +936,7 @@ def dispatch_async_delegation_batch(
     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
     task_indexes: Optional[list[int]] = None,
     task_transcripts: Optional[dict[str, str]] = None,
+    display_names: Any = None, display_tasks: Any = None,
 ) -> dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -888,6 +955,7 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, task_transcripts=task_transcripts,
+        display_names=display_names, display_tasks=display_tasks,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "

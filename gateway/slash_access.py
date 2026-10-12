@@ -34,6 +34,7 @@ class SlashAccessPolicy:
     enabled: bool  # gating active for this scope?
     admin_user_ids: frozenset[str]
     user_allowed_commands: frozenset[str]
+    implicit_user_commands: bool = True
 
     def is_admin(self, user_id: Optional[str]) -> bool:
         # Gating disabled -> everyone is admin so callers can use is_admin/can_run uniformly.
@@ -45,7 +46,8 @@ class SlashAccessPolicy:
         if self.is_admin(user_id):
             return True
         return bool(canonical_cmd) and (
-            canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS or canonical_cmd in self.user_allowed_commands
+            (self.implicit_user_commands and canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS)
+            or canonical_cmd in self.user_allowed_commands
         )
 
 
@@ -91,10 +93,15 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     """
     admin_key, cmd_key = _SCOPE_KEYS.get(scope, _SCOPE_KEYS["dm"])
     admin_ids = _coerce_id_list(extra.get(admin_key))
+    explicit_user_commands = cmd_key in extra
     cmds = _coerce_command_list(extra.get(cmd_key))
-    if scope == "dm" and not cmds:
+    if scope == "dm" and not explicit_user_commands:
         cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
-    return SlashAccessPolicy(enabled=bool(admin_ids), admin_user_ids=admin_ids, user_allowed_commands=cmds)
+    return SlashAccessPolicy(
+        enabled=bool(admin_ids), admin_user_ids=admin_ids,
+        user_allowed_commands=cmds,
+        implicit_user_commands=(scope == "dm" or not explicit_user_commands),
+    )
 
 
 def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:

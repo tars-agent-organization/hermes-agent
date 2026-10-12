@@ -572,6 +572,15 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS context_occupancy_alerts (
+    logical_session_id TEXT PRIMARY KEY,
+    fired_mask INTEGER NOT NULL DEFAULT 0,
+    max_observed_tokens INTEGER NOT NULL DEFAULT 0,
+    last_effective_context_length INTEGER NOT NULL DEFAULT 0,
+    last_observed_at REAL NOT NULL,
+    first_compression_seen INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,

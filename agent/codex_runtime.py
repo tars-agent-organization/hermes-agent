@@ -190,6 +190,8 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
             context_window = getattr(turn, "model_context_window", None)
             if isinstance(context_window, int) and context_window > 0:
                 compressor.context_length = context_window
+            from agent.context_usage import emit_context_usage
+            emit_context_usage(agent)
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
     if isinstance(messages, list):

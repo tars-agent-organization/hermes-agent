@@ -766,6 +766,56 @@ class SessionCompressionMixin:
         chain = self.get_compression_chain(session_id)
         return chain[-1] if chain else session_id
 
+    def get_compression_lineage_root(self, session_id: str) -> str:
+        """Return the logical root reached only through compression continuations."""
+        lineage = self.get_compression_lineage(session_id)
+        return lineage[0] if lineage else session_id
+
+    def claim_context_thresholds(
+        self, logical_session_id: str, *, prompt_tokens: int, effective_context_length: int,
+    ) -> List[int]:
+        """Atomically claim newly crossed 25/50/75 percent thresholds."""
+        if not logical_session_id or prompt_tokens <= 0 or effective_context_length <= 0:
+            return []
+        crossed_mask = 0
+        for bit, percent in enumerate((25, 50, 75)):
+            if prompt_tokens * 100 >= effective_context_length * percent:
+                crossed_mask |= 1 << bit
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT fired_mask FROM context_occupancy_alerts WHERE logical_session_id = ?",
+                (logical_session_id,),
+            ).fetchone()
+            fired_mask = int(row["fired_mask"]) if row else 0
+            newly_fired = crossed_mask & ~fired_mask
+            now = time.time()
+            conn.execute(
+                """
+                INSERT INTO context_occupancy_alerts (
+                    logical_session_id, fired_mask, max_observed_tokens,
+                    last_effective_context_length, last_observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(logical_session_id) DO UPDATE SET
+                    fired_mask = context_occupancy_alerts.fired_mask | excluded.fired_mask,
+                    max_observed_tokens = MAX(context_occupancy_alerts.max_observed_tokens,
+                                              excluded.max_observed_tokens),
+                    last_effective_context_length = excluded.last_effective_context_length,
+                    last_observed_at = excluded.last_observed_at
+                """,
+                (logical_session_id, crossed_mask, prompt_tokens, effective_context_length, now),
+            )
+            return [p for bit, p in enumerate((25, 50, 75)) if newly_fired & (1 << bit)]
+
+        return self._execute_write(_do)
+
+    def get_context_occupancy_state(self, logical_session_id: str) -> Dict[str, Any]:
+        row = self._read_one(
+            "SELECT * FROM context_occupancy_alerts WHERE logical_session_id = ?",
+            (logical_session_id,),
+        )
+        return dict(row) if row else {}
+
     def _is_compression_child_row(self, child: dict[str, Any]) -> bool:
         parent_id = child.get("parent_session_id")
         # A reset fork of a compression-ended parent is its own conversation, not the continuation (#114271).

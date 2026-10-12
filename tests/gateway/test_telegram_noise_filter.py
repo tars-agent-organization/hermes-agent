@@ -8,6 +8,7 @@ from agent.conversation_compression import (
 )
 from gateway.config import Platform
 from gateway.run import (
+    _context_notifications_enabled,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
@@ -118,6 +119,44 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
 
     for message in noisy_messages:
         assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
+
+
+def test_context_notifications_default_on_and_whatsapp_can_disable():
+    assert _context_notifications_enabled({}, "whatsapp") is True
+    config = {
+        "display": {
+            "platforms": {
+                "whatsapp": {"context_notifications": False},
+            }
+        }
+    }
+    assert _context_notifications_enabled(config, "whatsapp") is False
+    assert _context_notifications_enabled(config, "telegram") is True
+
+
+def test_disabled_context_notifications_suppress_pre_api_compression_status():
+    message = (
+        "📦 Pre-API compression: ~232,871 tokens near the context/output limit. "
+        "Compacting before the next model call."
+    )
+    assert _prepare_gateway_status_message(
+        "whatsapp",
+        "lifecycle",
+        message,
+        context_notifications_enabled=False,
+    ) is None
+    assert _prepare_gateway_status_message(
+        "whatsapp",
+        "lifecycle",
+        message,
+        context_notifications_enabled=True,
+    ) is None
+    assert _prepare_gateway_status_message(
+        "local",
+        "lifecycle",
+        message,
+        context_notifications_enabled=False,
+    ) == message
 
 
 def test_programmatic_surfaces_keep_raw_status():

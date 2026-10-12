@@ -436,58 +436,33 @@ class GatewayStatusCommandsMixin:
         return await _quiet(lambda: asyncio.to_thread(_resolve))
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
-        """Handle /agents command - list active agents and running tasks."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
-        from tools.process_registry import format_uptime_short, process_registry
-        now = time.time()
-        current_session_key = self._session_key_for_source(event.source)
-        running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
-        agent_rows: list[dict] = []
-        for session_key, agent in (getattr(self, "_running_agents", {}) or {}).items():
-            pending = agent is _AGENT_PENDING_SENTINEL
-            agent_rows.append({
-                "session_key": session_key,
-                "elapsed": max(0, int(now - float(running_started.get(session_key, now)))),
-                "state": t("gateway.agents.state_starting") if pending else t("gateway.agents.state_running"),
-                "session_id": "" if pending else str(getattr(agent, "session_id", "") or ""),
-                "model": "" if pending else str(getattr(agent, "model", "") or ""),
-            })
-        agent_rows.sort(key=lambda row: row["elapsed"], reverse=True)
-        procs = _quiet_sync(process_registry.list_sessions, [])
-        running_processes = [p for p in procs if p.get("status") == "running"]
-        background_tasks = [task for task in (getattr(self, "_background_tasks", set()) or set())
-                            if hasattr(task, "done") and not task.done()]
+        """Render one canonical, privacy-safe snapshot for /agents and /tasks."""
+        from gateway.activity_snapshot import build_activity_snapshot
+        from tools.process_registry import format_uptime_short
 
-        # Background (async) delegations — delegate_task(background=true).
-        # Live per-child activity comes from the registry's progress sampler (#51690): api calls, current
-        # tool, seconds since last activity.
-        from tools.async_delegation import list_async_delegations
-        delegations = [d for d in _quiet_sync(list_async_delegations, [])
-                       if d.get("status") in ("running", "stalling", "finalizing")]
-
-        def _agent_row(idx_row):
-            idx, row = idx_row
-            current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
-            sid = f" · `{row['session_id']}`" if row["session_id"] else ""
-            model = f" · `{row['model']}`" if row["model"] else ""
-            return [f"{idx}. `{row['session_key']}` · {row['state']} · "
-                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"]
-
-        def _proc_row(proc):
-            cmd = _clip(" ".join(str(proc.get("command", "")).split()), 90)
-            return [f"- `{proc.get('session_id', '?')}` · "
-                    f"{format_uptime_short(int(proc.get('uptime_seconds', 0)))} · `{cmd}`"]
-
-        lines = [t("gateway.agents.header"), "", t("gateway.agents.active_agents", count=len(agent_rows))]
-        lines += _capped_rows(list(enumerate(agent_rows, 1)), _agent_row)
-        lines += ["", t("gateway.agents.running_processes", count=len(running_processes))]
-        lines += _capped_rows(running_processes, _proc_row)
-        lines += ["", t("gateway.agents.async_jobs", count=len(background_tasks))]
-        if delegations:
-            lines += ["", t("gateway.agents.background_delegations", count=len(delegations))]
-            lines += _capped_rows(delegations, _agents_delegation_lines)
-        if not (agent_rows or running_processes or background_tasks or delegations):
-            lines += ["", t("gateway.agents.none")]
+        snapshot = build_activity_snapshot(self)
+        delegated_agents = snapshot["delegated_agents"]
+        processes = snapshot["processes"]
+        async_jobs = snapshot["async_jobs"]
+        lines = [t("gateway.agents.header")]
+        if delegated_agents:
+            lines.extend(["", "**Active delegated agents:** " + str(len(delegated_agents))])
+            for row in delegated_agents:
+                lines.append(
+                    f"- {row['display_name']} · {row['display_task']} · {row['status']} · "
+                    f"{format_uptime_short(row['elapsed_seconds'])}")
+        if processes:
+            lines.extend(["", t("gateway.agents.running_processes", count=len(processes))])
+            for row in processes:
+                lines.append(
+                    f"- `{row['handle']}` · {row['status']} · "
+                    f"{format_uptime_short(row['elapsed_seconds'])}")
+        if async_jobs:
+            lines.extend(["", t("gateway.agents.async_jobs", count=len(async_jobs))])
+            for row in async_jobs:
+                lines.append(f"- {row['category']} · {row['status']}")
+        if not delegated_agents and not processes and not async_jobs:
+            lines.extend(["", t("gateway.agents.none")])
         return "\n".join(lines)
 
     async def _handle_topup_command(self, event: MessageEvent) -> str:

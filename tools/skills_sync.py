@@ -222,10 +222,12 @@ def _copy_dir(src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, ignore=_ignore_runtime_cache)
 
 
-def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Optional[str]:
-    """Move a bundled skill's stale copy to its new canonical path after an upstream RENAME /
-    RECATEGORIZATION (else it is misread as user-deleted and stranded forever). Only a copy
-    byte-identical to the origin hash — proof *we* placed it — moves. Returns rel source path."""
+def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Optional[Path]:
+    """Find one tracked skill at a relocated user path and keep updating it there.
+
+    Categorizing a bundled skill is a user layout choice, not deletion. Discovery
+    fails closed for ambiguity, symlinks, special directories, and name mismatch.
+    """
     origin_hash = st.manifest.get(skill_name, "")
     if not origin_hash:
         return None
@@ -234,30 +236,51 @@ def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Opt
         for md in _iter_active_skill_mds():
             st.active_index.setdefault(_read_skill_name(md, md.parent.name), []).append(md.parent)
         st.hub_paths = _read_hub_install_paths()
-    for candidate in st.active_index.get(skill_name, []):
-        if candidate == dest or not candidate.is_dir():
-            continue
+    candidates = [
+        candidate for candidate in st.active_index.get(skill_name, [])
+        if candidate != dest and candidate.is_dir() and not candidate.name.endswith(".bak")
+    ]
+    # Recover one interrupted update at a categorized path.
+    for md in _skills_dir().rglob("SKILL.md"):
+        candidate = md.parent
+        if candidate.name == f"{skill_name}.bak" and not candidate.is_symlink():
+            with suppress(ValueError):
+                candidate.resolve().relative_to(_skills_dir().resolve())
+                candidates.append(candidate)
+    safe_candidates = []
+    for candidate in candidates:
         try:
             rel = _rel_skills_posix(candidate)
         except ValueError:
             continue
-        if rel in st.hub_paths:  # the hub owns its install paths
+        if rel in st.hub_paths or any(
+            part in {".archive", ".hub", ".pytest_cache", ".restore-backups"}
+            or part.endswith(".bak") and part != f"{skill_name}.bak"
+            for part in candidate.relative_to(_skills_dir()).parts[:-1]
+        ):
             continue
-        if not _matches_origin_hash(candidate, origin_hash):  # moving a customized copy would edit user work
-            st.say(
-                f"  ⚠ {skill_name}: upstream moved this skill to {_rel_skills_posix(dest)}, but your "
-                f"modified copy at {rel} was kept — it will not receive updates. "
-                f"Run `hermes skills reset {skill_name} --restore` to move to the new location.")
+        if any(parent.is_symlink() for parent in [candidate, *candidate.parents] if _skills_dir() in parent.parents or parent == _skills_dir()):
             continue
+        safe_candidates.append(candidate)
+    if len(safe_candidates) != 1:
+        return None
+    candidate = safe_candidates[0]
+    rel = _rel_skills_posix(candidate)
+    if not _matches_origin_hash(candidate, origin_hash):
+        if skill_name not in st.user_modified:
+            st.user_modified.append(skill_name)
+        st.say(f"  ~ {skill_name} (user-modified at {rel}, skipping)")
+        return candidate
+    if candidate.name.endswith(".bak"):
+        restored = candidate.with_suffix("")
         try:
-            _move_dir(candidate, dest)
+            _move_dir(candidate, restored)
         except OSError:
-            logger.warning("Could not relocate renamed skill %s -> %s", candidate, dest, exc_info=True)
+            logger.warning("Could not recover relocated skill backup %s", candidate, exc_info=True)
             return None
-        logger.info("Relocated renamed bundled skill: %s -> %s", candidate, dest)
-        st.say(f"  → {skill_name} (moved {rel} → {_rel_skills_posix(dest)})")
-        return rel
-    return None
+        candidate = restored
+    logger.info("Using relocated bundled skill in place: %s", candidate)
+    return candidate
 
 
 @dataclass
@@ -418,17 +441,22 @@ def sync_skills(quiet: bool = False) -> dict:
             st.suppressed.append(skill_name)
             continue
         dest = _compute_relative_dest(skill_src, bundled_dir)
+        effective_dest = dest
         bundled_hash = _dir_hash(skill_src)
         # Recoveries run BEFORE classification so a missing dest isn't misread as user-deleted.
         _recover_orphan_backup(dest)
-        if not dest.exists() and skill_name in st.manifest and _recover_renamed_skill(st, skill_name, dest):
-            st.relocated.append(skill_name)
+        if not dest.exists() and skill_name in st.manifest:
+            relocated = _recover_renamed_skill(st, skill_name, dest)
+            if relocated is not None:
+                effective_dest = relocated
+                if skill_name not in st.user_modified:
+                    st.relocated.append(skill_name)
         if skill_name in external_index:
             _defer_to_external(st, skill_name, dest, bundled_hash)
         elif skill_name not in st.manifest:
             _install_new_skill(st, skill_name, skill_src, dest, bundled_hash)
-        elif dest.exists():
-            _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
+        elif effective_dest.exists():
+            _update_existing_skill(st, skill_name, skill_src, effective_dest, bundled_hash)
         else:
             st.skipped += 1  # in manifest but not on disk — user deleted it
     # Clean manifest entries for skills removed upstream once no copy is left. A dropped built-in still

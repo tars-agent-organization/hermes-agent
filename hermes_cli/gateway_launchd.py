@@ -25,6 +25,27 @@ def _gw():
     return gateway
 
 
+def _system_launchd_installed_for_active_home() -> bool:
+    """Whether the system LaunchDaemon belongs to the active Hermes home.
+
+    A machine-wide plist is visible from every profile, checkout, and isolated
+    test process.  Treating mere path existence as ownership made an unrelated
+    daemon hijack those flows.  System installs are supported for the canonical
+    Hermes home and its named profiles; other homes keep their own LaunchAgent.
+    """
+    plist = _gw().get_launchd_system_plist_path()
+    if not plist.exists():
+        return False
+    try:
+        from hermes_constants import get_real_home
+
+        managed_root = (Path(get_real_home()) / ".hermes").resolve()
+        active_home = Path(_gw().get_hermes_home()).resolve()
+        return active_home == managed_root or managed_root in active_home.parents
+    except (OSError, RuntimeError):
+        return False
+
+
 def get_launchd_label() -> str:
     """Return the launchd service label, scoped per profile."""
     suffix = _gw()._profile_suffix()
@@ -37,6 +58,13 @@ def _probe_launchd_domain_for_label(label: str) -> str:
     different domains, so never reuse the cached ``_launchd_domain()`` for another label."""
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     gui_domain, user_domain = f"gui/{uid}", f"user/{uid}"
+
+    if label == _gw().get_launchd_label() and _system_launchd_installed_for_active_home():
+        try:
+            subprocess.run(["launchctl", "print", f"system/{label}"], check=True, timeout=5, capture_output=True)
+            return "system"
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
 
     launchctl_errors = (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError)
     for domain in (gui_domain, user_domain):
@@ -607,6 +635,11 @@ def refresh_launchd_plist_if_needed() -> bool:
 
 
 def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_path: bool = False):
+    system_plist = _gw().get_launchd_system_plist_path()
+    if _system_launchd_installed_for_active_home():
+        print(f"System LaunchDaemon already installed at: {system_plist}")
+        print("The login-scoped LaunchAgent will not be created.")
+        return
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
     # A plist pinning another home is another install's gateway, --force included; --force-unit-path repoints.
@@ -676,6 +709,12 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
 
 
 def launchd_uninstall():
+    system_plist = _gw().get_launchd_system_plist_path()
+    if _system_launchd_installed_for_active_home():
+        _gw().print_error("The gateway is installed as a system LaunchDaemon.")
+        print(f"  sudo launchctl bootout system/{_gw().get_launchd_label()}")
+        print(f"  sudo rm {system_plist}")
+        sys.exit(1)
     plist_path = _gw().get_launchd_plist_path()
     # Captured: uninstalling an already-unloaded job is fine — don't print Boot-out failed: 3.
     subprocess.run(
@@ -688,6 +727,16 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    system_plist = _gw().get_launchd_system_plist_path()
+    if _system_launchd_installed_for_active_home():
+        loaded, pid = _gw()._launchd_print_service_pid("system", _gw().get_launchd_label())
+        if loaded and pid is not None:
+            print(f"✓ System LaunchDaemon is already running (PID {pid})")
+            return
+        _gw().print_error("The system LaunchDaemon is installed but is not running.")
+        print(f"  sudo launchctl bootstrap system {system_plist}")
+        print(f"  sudo launchctl kickstart system/{_gw().get_launchd_label()}")
+        sys.exit(1)
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
 
@@ -739,6 +788,10 @@ def _launchd_ok(message: str) -> None:
 
 
 def launchd_stop():
+    if _system_launchd_installed_for_active_home():
+        _gw().print_error("Stopping the system LaunchDaemon requires administrator privileges.")
+        print(f"  sudo launchctl bootout system/{get_launchd_label()}")
+        sys.exit(1)
     target = f"{_launchd_domain()}/{get_launchd_label()}"
     _gw()._mark_planned_stop()
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
@@ -778,6 +831,10 @@ def _wait_for_launchd_service_pid(
 
 def launchd_restart():
     label = _gw().get_launchd_label()
+    if _system_launchd_installed_for_active_home():
+        _gw().print_error("Restarting the system LaunchDaemon requires administrator privileges.")
+        print(f"  sudo launchctl kickstart -k system/{label}")
+        sys.exit(1)
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
     # A kickstart re-runs whatever definition launchd already holds. After an
@@ -899,10 +956,13 @@ def wait_for_launchd_gateway_supervision(
 
 
 def launchd_status(deep: bool = False):
-    plist_path = _gw().get_launchd_plist_path()
+    system_daemon = _system_launchd_installed_for_active_home()
+    plist_path = _gw().get_launchd_system_plist_path() if system_daemon else _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
     try:
-        result = subprocess.run(["launchctl", "list", label], timeout=10, **_gw()._CAPTURE_TEXT, check=False)
+        result = subprocess.run(
+            ["launchctl", "print", f"system/{label}"] if system_daemon else ["launchctl", "list", label],
+            timeout=10, **_gw()._CAPTURE_TEXT, check=False)
         service_listed = result.returncode == 0
         list_output = result.stdout
     except subprocess.TimeoutExpired:
@@ -910,7 +970,11 @@ def launchd_status(deep: bool = False):
         list_output = ""
 
     # `launchctl list` exits 0 for any registered definition (even `state = not running`); only a PID proves a process.
-    launchd_pid = _gw()._parse_launchd_pid_from_list_output(list_output) if service_listed else None
+    launchd_pid = (
+        _gw()._parse_launchd_pid_from_print_output(list_output)
+        if system_daemon and service_listed
+        else _gw()._parse_launchd_pid_from_list_output(list_output) if service_listed else None
+    )
 
     # Hermes PID may be a detached fallback process; when launchd IS supervising both PIDs match — don't double-count.
     from gateway.status import get_running_pid
@@ -922,7 +986,9 @@ def launchd_status(deep: bool = False):
     launchd_unsupported = _gw()._launchd_unsupported_marker_exists()
 
     print(f"Launchd plist: {plist_path}")
-    if _gw().launchd_plist_is_current():
+    if system_daemon:
+        print("✓ System LaunchDaemon installed (starts at boot without GUI login)")
+    elif _gw().launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
     else:
         print("⚠ Service definition is stale relative to the current Hermes install")
@@ -936,7 +1002,8 @@ def launchd_status(deep: bool = False):
             print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
     elif launchd_pid is not None:
         print(f"✓ Gateway is supervised by launchd (PID {launchd_pid})")
-        print("  Auto-start at login and auto-restart on crash are available.")
+        print("  Auto-start at boot and auto-restart on crash are available." if system_daemon else
+              "  Auto-start at login and auto-restart on crash are available.")
         if launchd_unsupported:
             print("  (launchd domain was previously unavailable but is now working)")
     elif launchd_unsupported:

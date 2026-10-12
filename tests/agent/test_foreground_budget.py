@@ -25,6 +25,20 @@ def test_disabled_guard_preserves_existing_tool_behavior() -> None:
     assert guard.before_tool("terminal", {"command": "sleep 1"}).allowed
 
 
+def test_inline_platform_blocks_detached_delegation_but_keeps_other_tools() -> None:
+    from agent.foreground_budget import ForegroundBudgetGuard
+
+    guard = ForegroundBudgetGuard(0, background_delegation_disabled=True)
+    guard.start_turn()
+
+    delegation = guard.before_tool("delegate_task", {"goal": "do the work"})
+
+    assert delegation.allowed is False
+    assert delegation.code == "background_delegation_disabled"
+    assert "inline" in delegation.message.lower()
+    assert guard.before_tool("write_file", {"path": "x"}).allowed
+
+
 def test_budget_blocks_new_foreground_tool_after_deadline() -> None:
     from agent.foreground_budget import ForegroundBudgetGuard
 
@@ -93,6 +107,47 @@ def test_new_turn_resets_deadline_and_handoff_state() -> None:
     assert guard.before_tool("write_file", {"path": "x"}).allowed
     clock.now = 12
     assert guard.before_tool("delegate_task", {"goal": "two"}).allowed
+
+
+def test_strict_handoff_ack_can_quote_only_the_received_request() -> None:
+    from agent.foreground_budget import ForegroundBudgetGuard
+
+    guard = ForegroundBudgetGuard(
+        15,
+        strict_background_handoff=True,
+        strict_handoff_ack='Recebi: "{message}". Encaminhei em background.',
+    )
+    guard.start_turn()
+    guard.set_turn_user_message(
+        "[Thread context — prior messages]\nconteudo interno\n"
+        "[End of thread context]\n\n- acompanha esse tema."
+    )
+
+    assert guard.observe_tool_result(
+        "delegate_task",
+        {"goal": "registrar acompanhamento"},
+        '{"status":"dispatched"}',
+    )
+    assert guard.consume_strict_handoff_ack() == (
+        'Recebi: "- acompanha esse tema.". Encaminhei em background.'
+    )
+
+
+def test_strict_handoff_ack_keeps_static_config_compatible() -> None:
+    from agent.foreground_budget import ForegroundBudgetGuard
+
+    guard = ForegroundBudgetGuard(
+        15,
+        strict_background_handoff=True,
+        strict_handoff_ack="Estou verificando em background.",
+    )
+    guard.start_turn()
+    guard.set_turn_user_message("pedido")
+
+    assert guard.observe_tool_result(
+        "delegate_task", {"goal": "trabalho"}, '{"status":"dispatched"}'
+    )
+    assert guard.consume_strict_handoff_ack() == "Estou verificando em background."
 
 
 @pytest.mark.parametrize(

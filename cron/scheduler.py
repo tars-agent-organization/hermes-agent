@@ -1550,11 +1550,15 @@ def _run_no_agent_job(
 
     if not ok:
         # Deliver the error: a silently broken watchdog is the worst-case outcome.
-        alert = (
-            f"⚠ Cron watchdog '{job_name}' script failed\n\n"
-            f"{output}\n\n"
-            f"Time: {now_iso}"
-        )
+        stdout_marker = "\nstdout:\n"
+        if stdout_marker in output:
+            alert = output.rsplit(stdout_marker, 1)[1].strip()
+        else:
+            alert = (
+                f"⚠ Cron watchdog '{job_name}' script failed\n\n"
+                f"{output}\n\n"
+                f"Time: {now_iso}"
+            )
         return False, f"{header}**Status:** script failed\n\n{output}\n", alert, output
 
     # wakeAgent=false is a silent signal, same as empty stdout.
@@ -2943,6 +2947,10 @@ def _compose_run_delivery(
     elif success:
         deliver_content = final_response
         _resolve_incidents_for_recovered_job(job)
+    elif job.get("no_agent"):
+        # no_agent already produced a bounded watchdog alert containing the
+        # script's actionable stdout/stderr; do not reclassify it as a provider failure.
+        deliver_content = final_response
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).

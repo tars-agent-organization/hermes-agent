@@ -889,12 +889,20 @@ class TurnRunner:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
-        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
+        from gateway.run import (
+            _context_notifications_enabled, _platform_config_key, _prepare_gateway_status_message,
+            _redact_gateway_user_facing_secrets, _send_or_update_status_coro,
+        )
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
         if ctx.mute_notification_reply or not self._status_live():
             return
-        prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
+        prepared = _prepare_gateway_status_message(
+            ctx.source.platform, event_type, message,
+            context_notifications_enabled=_context_notifications_enabled(
+                ctx.user_config, _platform_config_key(ctx.source.platform),
+            ),
+        )
         if prepared is None:
             logger.debug(
                 "status_callback suppressed for %s/%s: %s",
@@ -1269,6 +1277,34 @@ class TurnRunner:
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
         agent.notice_clear_callback = None  # sends can't be retracted
+        from gateway.run import _context_notifications_enabled, _platform_config_key
+        if _context_notifications_enabled(ctx.user_config, _platform_config_key(ctx.source.platform)):
+            def _context_usage_callback(sample: dict) -> None:
+                try:
+                    from gateway.context_occupancy import ContextOccupancyMonitor
+                    session_db = getattr(runner, "_session_db", None)
+                    db = getattr(session_db, "_db", session_db)
+                    if db is None:
+                        return
+                    physical = str(sample.get("session_id") or "")
+                    logical = db.get_compression_lineage_root(physical)
+                    alerts = ContextOccupancyMonitor(db).observe(
+                        logical_session_id=logical,
+                        prompt_tokens=sample.get("prompt_tokens"),
+                        effective_context_length=sample.get("context_length"),
+                        model=sample.get("model") or "unknown",
+                        provider=sample.get("provider") or "unknown",
+                    )
+                    for alert in alerts:
+                        self._schedule(
+                            runner._deliver_private_context_alert(alert.message),
+                            "context alert delivery scheduling error",
+                        )
+                except Exception:
+                    logger.warning("Context occupancy observation failed", exc_info=True)
+            agent.context_usage_callback = _context_usage_callback
+        else:
+            agent.context_usage_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
         agent._voice_turn_pending = ctx.voice_turn  # auxiliary.voice_chat route
@@ -1720,8 +1756,15 @@ class TurnRunner:
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             from agent.notification_presentation import notification_turn
+            from agent.provenance import response_provenance_context
+            from gateway.run import _log_response_provenance, _response_available_context
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
-                return agent.run_conversation(api_message, **kwargs)
+                with response_provenance_context(
+                    available_context=_response_available_context(agent, agent_history)
+                ) as provenance:
+                    result = agent.run_conversation(api_message, **kwargs)
+            _log_response_provenance(provenance)
+            return result
         finally:
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the

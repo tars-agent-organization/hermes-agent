@@ -43,6 +43,7 @@ class ForegroundBudgetGuard:
         budget_seconds: float | int,
         *,
         strict_background_handoff: bool = False,
+        background_delegation_disabled: bool = False,
         strict_handoff_ack: str = DEFAULT_STRICT_HANDOFF_ACK,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -57,11 +58,15 @@ class ForegroundBudgetGuard:
             )
         self.budget_seconds = float(budget_seconds)
         self.strict_background_handoff = bool(strict_background_handoff)
+        self.background_delegation_disabled = bool(
+            background_delegation_disabled
+        )
         self.strict_handoff_ack = (
             str(strict_handoff_ack or "").strip() or DEFAULT_STRICT_HANDOFF_ACK
         )
         self._clock = clock
         self._turn_started_at: float | None = None
+        self._turn_user_message = ""
         self._handoff_started = False
         self._strict_handoff_ack_pending = False
         self._lock = threading.Lock()
@@ -73,8 +78,26 @@ class ForegroundBudgetGuard:
     def start_turn(self) -> None:
         with self._lock:
             self._turn_started_at = self._clock()
+            self._turn_user_message = ""
             self._handoff_started = False
             self._strict_handoff_ack_pending = False
+
+    def set_turn_user_message(self, message: Any) -> None:
+        """Set the clean user request available to handoff acknowledgement templates.
+
+        Gateway turns can prepend reply and thread context before the actual request.
+        Keep only the text after the explicit context terminator and collapse whitespace
+        so a deterministic acknowledgement cannot echo an entire thread.
+        """
+        text = str(message or "")
+        marker = "[End of thread context]"
+        if marker in text:
+            text = text.rsplit(marker, 1)[-1]
+        text = " ".join(text.split()).strip()
+        if len(text) > 280:
+            text = text[:277].rstrip() + "..."
+        with self._lock:
+            self._turn_user_message = text
 
     def observe_tool_result(
         self,
@@ -114,12 +137,24 @@ class ForegroundBudgetGuard:
             if not self._strict_handoff_ack_pending:
                 return None
             self._strict_handoff_ack_pending = False
-            return self.strict_handoff_ack
+            return self.strict_handoff_ack.replace(
+                "{message}", self._turn_user_message or "seu pedido"
+            )
 
     def before_tool(
         self, function_name: str, function_args: Mapping[str, Any] | None
     ) -> ForegroundBudgetDecision:
         with self._lock:
+            if self.background_delegation_disabled and function_name == "delegate_task":
+                return ForegroundBudgetDecision(
+                    allowed=False,
+                    code="background_delegation_disabled",
+                    message=(
+                        "Detached background delegation is disabled for this "
+                        "platform. Process the user's request inline in the "
+                        "current turn and return the actual result directly."
+                    ),
+                )
             if self.strict_background_handoff and self._handoff_started:
                 return ForegroundBudgetDecision(
                     allowed=False,
@@ -190,19 +225,27 @@ def foreground_budget_guard_from_config(
     """Build a guard from config, scoped strictly to gateway sessions."""
     budget: Any = 0
     strict_background_handoff = False
+    background_delegation_disabled = False
     strict_handoff_ack = DEFAULT_STRICT_HANDOFF_ACK
     if gateway_session_key and isinstance(config, Mapping):
         agent_config = config.get("agent")
         if isinstance(agent_config, Mapping):
             budget = agent_config.get("foreground_budget_seconds", 0)
+            platform_key = str(platform or "").strip().lower()
+            if not platform_key:
+                parts = str(gateway_session_key).split(":", 4)
+                platform_key = parts[2].strip().lower() if len(parts) >= 3 else ""
             raw_platforms = agent_config.get("strict_background_handoff_platforms", [])
             if isinstance(raw_platforms, (list, tuple, set)):
-                platform_key = str(platform or "").strip().lower()
-                if not platform_key:
-                    parts = str(gateway_session_key).split(":", 4)
-                    platform_key = parts[2].strip().lower() if len(parts) >= 3 else ""
                 strict_background_handoff = platform_key in {
                     str(item).strip().lower() for item in raw_platforms
+                }
+            disabled_platforms = agent_config.get(
+                "disable_background_delegation_platforms", []
+            )
+            if isinstance(disabled_platforms, (list, tuple, set)):
+                background_delegation_disabled = platform_key in {
+                    str(item).strip().lower() for item in disabled_platforms
                 }
             strict_handoff_ack = agent_config.get(
                 "strict_background_handoff_ack", DEFAULT_STRICT_HANDOFF_ACK
@@ -210,6 +253,7 @@ def foreground_budget_guard_from_config(
     return ForegroundBudgetGuard(
         budget,
         strict_background_handoff=strict_background_handoff,
+        background_delegation_disabled=background_delegation_disabled,
         strict_handoff_ack=strict_handoff_ack,
         clock=clock,
     )

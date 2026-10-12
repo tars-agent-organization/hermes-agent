@@ -720,7 +720,14 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
-def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
+_CONTEXT_NOTIFICATION_STATUS_RE = re.compile(
+    r"(?:pre-api\s+compression|context(?:/output)?\s+limit)", re.IGNORECASE | re.DOTALL,
+)
+
+
+def _prepare_gateway_status_message(
+    platform: Any, event_type: str, message: str, *, context_notifications_enabled: bool = True,
+) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
     Local/CLI keep the raw diagnostic stream; messaging surfaces drop transient aux/compression noise."""
@@ -731,6 +738,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    if not context_notifications_enabled and _CONTEXT_NOTIFICATION_STATUS_RE.search(text):
+        return None
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
         _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)
@@ -873,6 +882,30 @@ def _resolve_gateway_display_bool(
     if value is None:
         return bool(default)
     return bool(value)
+
+
+def _context_notifications_enabled(user_config: dict, platform_key: str) -> bool:
+    return _resolve_gateway_display_bool(
+        user_config, platform_key, "context_notifications", default=True,
+    )
+
+
+def _response_available_context(agent: Any, history: list[dict[str, Any]]) -> set[str]:
+    available = {"direct_user_input"}
+    if history:
+        available.add("session_history")
+    if getattr(agent, "_memory_store", None) is not None and (
+        getattr(agent, "_memory_enabled", False) or getattr(agent, "_user_profile_enabled", False)
+    ):
+        available.add("persistent_memory")
+    return available
+
+
+def _log_response_provenance(provenance: Any) -> None:
+    try:
+        logger.info("%s", provenance.format_log_line())
+    except Exception:
+        logger.warning("response provenance logging failed")
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -4201,7 +4234,7 @@ class GatewayRunner(
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(self, context: SessionContext, *, trusted_request_metadata: Optional[dict] = None) -> list:
         """Set session context variables (contextvars, not os.environ, so concurrent messages can't
         overwrite each other). Returns reset tokens for ``_clear_session_env`` in a ``finally``."""
         from gateway.session_context import set_session_vars
@@ -4209,6 +4242,10 @@ class GatewayRunner(
         # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
         _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        ingress_metadata = dict(trusted_request_metadata or {})
+        relayed = bool(getattr(context.source, "delivered_via_upstream_relay", False))
+        ingress_metadata["hermes_ingress_direct"] = not relayed
+        ingress_metadata["hermes_relayed"] = relayed
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -4224,7 +4261,25 @@ class GatewayRunner(
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
-            cron_session="")
+            cron_session="",
+            trusted_request_metadata=ingress_metadata)
+
+    async def _deliver_private_context_alert(self, content: str) -> bool:
+        """Deliver context-pressure administration only to a private WhatsApp home."""
+        adapter = (getattr(self, "adapters", None) or {}).get(Platform.WHATSAPP)
+        home = self.config.get_home_channel(Platform.WHATSAPP) if getattr(self, "config", None) else None
+        chat_id = str(getattr(home, "chat_id", "") or "")
+        if adapter is None or not chat_id or chat_id.endswith("@g.us"):
+            logger.warning("Context alert suppressed: private WhatsApp home unavailable")
+            return False
+        try:
+            result = await adapter.send(
+                chat_id, content, metadata=_non_conversational_metadata(platform=Platform.WHATSAPP),
+            )
+            return bool(getattr(result, "success", False))
+        except Exception:
+            logger.warning("Private WhatsApp context alert delivery failed", exc_info=True)
+            return False
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""

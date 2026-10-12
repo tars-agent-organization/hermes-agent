@@ -242,6 +242,18 @@ class PluginContext:
         """Mark this load as timed out; every later ``register_*``/``subscribe``/``on_unload`` is ignored."""
         self._load_abandoned = True
 
+    def register_provenance_source(
+        self, tool_name: str, source: str, *, defer_until_success: bool = False
+    ) -> bool:
+        """Associate a plugin tool with a fixed, privacy-safe provenance category."""
+        try:
+            from agent.provenance import register_tool_source
+            return register_tool_source(
+                tool_name, source, defer_until_success=defer_until_success
+            )
+        except Exception:
+            return False
+
     @property
     def plugin_id(self) -> str:
         """Return the effective registry id used for this plugin's namespaces."""

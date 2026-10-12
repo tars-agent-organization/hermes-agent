@@ -1520,6 +1520,12 @@ def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]
 
 def _probe_launchd_service_running() -> bool:
     """True when the plist exists AND launchd is running a process for the current label."""
+    if _system_launchd_installed_for_active_home():
+        try:
+            loaded, pid = _launchd_print_service_pid("system", get_launchd_label())
+            return loaded and pid is not None
+        except subprocess.TimeoutExpired:
+            return False
     return get_launchd_plist_path().exists() and _launchctl_label_supervising_process(get_launchd_label())
 
 
@@ -1582,7 +1588,7 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
     if is_macos():
         return GatewayRuntimeSnapshot(
             manager="launchd",
-            service_installed=get_launchd_plist_path().exists(),
+            service_installed=_launchd_service_installed(),
             service_running=_probe_launchd_service_running(),
             gateway_pids=gateway_pids,
             service_scope="launchd",
@@ -2939,6 +2945,15 @@ def get_launchd_plist_path() -> Path:
     return home / "Library" / "LaunchAgents" / f"{name}.plist"
 
 
+def get_launchd_system_plist_path() -> Path:
+    """System LaunchDaemon path for the active profile label."""
+    return Path("/Library/LaunchDaemons") / f"{get_launchd_label()}.plist"
+
+
+def _launchd_service_installed() -> bool:
+    return get_launchd_plist_path().exists() or _system_launchd_installed_for_active_home()
+
+
 def launchd_gateway_labels_for_install() -> list[str]:
     """Launchd labels for every profile of THIS install (root first, then profiles by name). Derived from
     the profile layout, NOT by globbing ``~/Library/LaunchAgents``, so a sandboxed HERMES_HOME never
@@ -3977,6 +3992,7 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
 
 from hermes_cli.gateway_launchd import (
     get_launchd_label,
+    _system_launchd_installed_for_active_home,
     _probe_launchd_domain_for_label,
     _launchd_domain,
     _LAUNCHD_JOB_UNLOADED_EXIT_CODES,
@@ -4827,7 +4843,7 @@ def _is_service_running() -> bool:
     """Check if the gateway service is currently running."""
     if supports_systemd_services():
         return _systemd_unit_is_active(False) or _systemd_unit_is_active(True)
-    if is_macos() and get_launchd_plist_path().exists():
+    if is_macos() and _launchd_service_installed():
         try:
             return _launchd_service_registered(get_launchd_label(), timeout=10)
         except subprocess.TimeoutExpired:
@@ -5036,7 +5052,7 @@ def _installed_service_kind_for(windows) -> str | None:
     (a thunk so it runs last, like every caller's original ladder), else None."""
     if _systemd_unit_installed():
         return "systemd"
-    if is_macos() and get_launchd_plist_path().exists():
+    if is_macos() and _launchd_service_installed():
         return "launchd"
     return "windows" if windows() else None
 
@@ -5775,4 +5791,3 @@ def _pm_runtime_venv_dir(project_root: Path | None = None) -> Path | None:
 
     venv = selected_venv(root)  # a malformed committed selection raises: fail closed
     return venv if venv.is_dir() else None
-

@@ -1221,6 +1221,17 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
                 "agent.strict_background_handoff_ack must be a non-empty string",
                 "Set the short acknowledgment sent after background dispatch",
             )
+    if isinstance(agent_cfg, dict) and "disable_background_delegation_platforms" in agent_cfg:
+        disabled_platforms = agent_cfg["disable_background_delegation_platforms"]
+        if not isinstance(disabled_platforms, list) or any(
+            not isinstance(item, str) or not item.strip() for item in disabled_platforms
+        ):
+            _issue(
+                issues,
+                "error",
+                "agent.disable_background_delegation_platforms must be a list of platform names",
+                "Use a YAML list such as [slack], or [] to allow delegation everywhere",
+            )
     _validate_voice(config, issues)
     _validate_timezone(config, issues)
     cp = config.get("custom_providers")

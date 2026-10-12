@@ -295,8 +295,8 @@ class TestRenamedBundledSkillRecovery:
         (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n{body}")
         return d
 
-    def test_rename_relocates_unmodified_copy(self, tmp_path):
-        """The stale copy is moved to the new path and updated, not stranded."""
+    def test_upstream_recategorization_preserves_user_layout(self, tmp_path):
+        """An existing categorized copy is updated in place, not moved again."""
         bundled = tmp_path / "bundled"
         skills_dir = tmp_path / "user_skills"
         manifest_file = skills_dir / ".bundled_manifest"
@@ -317,12 +317,12 @@ class TestRenamedBundledSkillRecovery:
             recorded = _read_manifest()["moved-skill"]
 
         new = skills_dir / "newcat" / "moved-skill"
-        assert new.exists(), "renamed skill was not relocated to the new path"
-        assert not old.exists(), "stale copy left behind — would shadow forever"
+        assert old.exists(), "the user's categorized layout was not preserved"
+        assert not new.exists(), "sync unexpectedly moved the user's skill"
         assert "moved-skill" in result["relocated"]
-        # Having been relocated, it then takes the normal update path.
+        # Having been discovered at its relocated path, it takes the normal update path.
         assert "moved-skill" in result["updated"]
-        assert "Updated upstream" in (new / "SKILL.md").read_text()
+        assert "Updated upstream" in (old / "SKILL.md").read_text()
         # Future syncs can now detect further upstream changes.
         assert recorded == _dir_hash(bundled / "newcat" / "moved-skill")
 
@@ -525,6 +525,25 @@ class TestDroppedBuiltinProvenance:
             (bundled / "cat" / name / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n")
         return bundled
 
+    def _setup_bundled(self, tmp_path):
+        bundled = tmp_path / "bundled_skills"
+        (bundled / "category" / "new-skill").mkdir(parents=True)
+        (bundled / "category" / "new-skill" / "SKILL.md").write_text("# New")
+        (bundled / "category" / "new-skill" / "main.py").write_text("print(1)")
+        (bundled / "category" / "DESCRIPTION.md").write_text("Category desc")
+        (bundled / "old-skill").mkdir()
+        (bundled / "old-skill" / "SKILL.md").write_text("# Old")
+        return bundled
+
+    def _patches(self, bundled, skills_dir, manifest_file):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        return stack
+
     def _sync(self, bundled):
         with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
                 patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"):
@@ -557,6 +576,175 @@ class TestDroppedBuiltinProvenance:
         (skills / ".curator_suppressed").write_text("resurrected\n")
 
         assert provenance("resurrected") == "bundled"
+
+    def test_relocated_root_skill_is_updated_in_its_new_category(self, tmp_path):
+        """A tracked root skill may be categorized without losing upstream updates."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            moved = skills_dir / "computer-use" / "old-skill"
+            moved.parent.mkdir(parents=True)
+            shutil.move(str(skills_dir / "old-skill"), str(moved))
+            (bundled / "old-skill" / "SKILL.md").write_text("# Old v2\n")
+
+            result = sync_skills(quiet=True)
+
+        assert result["updated"] == ["old-skill"]
+        assert (moved / "SKILL.md").read_text() == "# Old v2\n"
+        assert not (skills_dir / "old-skill").exists()
+
+    def test_relocated_deep_skill_is_updated_without_recreating_canonical_path(self, tmp_path):
+        """A nested bundled skill can move one category level up and still update."""
+        bundled = tmp_path / "bundled"
+        source = bundled / "mlops" / "evaluation" / "foo"
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text("---\nname: foo\n---\n# v1\n")
+        skills_dir = tmp_path / "home" / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            moved = skills_dir / "mlops" / "foo"
+            moved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(skills_dir / "mlops" / "evaluation" / "foo"), str(moved))
+            (source / "SKILL.md").write_text("---\nname: foo\n---\n# v2\n")
+
+            result = sync_skills(quiet=True)
+
+        assert result["updated"] == ["foo"]
+        assert "# v2" in (moved / "SKILL.md").read_text()
+        assert not (skills_dir / "mlops" / "evaluation" / "foo").exists()
+
+    def test_relocated_user_modified_skill_is_not_overwritten(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            moved = skills_dir / "computer-use" / "old-skill"
+            moved.parent.mkdir(parents=True)
+            shutil.move(str(skills_dir / "old-skill"), str(moved))
+            (moved / "SKILL.md").write_text("# custom\n")
+            (bundled / "old-skill" / "SKILL.md").write_text("# upstream v2\n")
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" in result["user_modified"]
+        assert (moved / "SKILL.md").read_text() == "# custom\n"
+        assert not (skills_dir / "old-skill").exists()
+
+    def test_relocated_orphaned_backup_is_recovered_and_updated(self, tmp_path):
+        """An interrupted update must recover a categorized skill's .bak copy."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            moved = skills_dir / "computer-use" / "old-skill"
+            moved.parent.mkdir(parents=True)
+            shutil.move(str(skills_dir / "old-skill"), str(moved))
+            backup = moved.with_suffix(".bak")
+            shutil.move(str(moved), str(backup))
+            (bundled / "old-skill" / "SKILL.md").write_text("# upstream v2\n")
+
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" in result["updated"]
+        assert (moved / "SKILL.md").read_text() == "# upstream v2\n"
+        assert not backup.exists()
+
+    def test_missing_relocated_candidate_remains_deleted(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            shutil.rmtree(skills_dir / "old-skill")
+            (bundled / "old-skill" / "SKILL.md").write_text("# upstream v2\n")
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" not in result["updated"]
+        assert not (skills_dir / "old-skill").exists()
+
+    def test_relocated_candidates_fail_closed_for_ambiguity_and_name_mismatch(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            original = skills_dir / "old-skill"
+            first = skills_dir / "one" / "old-skill"
+            second = skills_dir / "two" / "old-skill"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            shutil.move(str(original), str(first))
+            shutil.copytree(first, second)
+            (bundled / "old-skill" / "SKILL.md").write_text("# upstream v2\n")
+            ambiguous = sync_skills(quiet=True)
+
+            shutil.rmtree(second)
+            mismatch = skills_dir / "one" / "renamed"
+            shutil.move(str(first), str(mismatch))
+            (mismatch / "SKILL.md").write_text("---\nname: not-old-skill\n---\n# v1\n")
+            mismatch_result = sync_skills(quiet=True)
+
+        assert "old-skill" not in ambiguous["updated"]
+        assert "old-skill" not in mismatch_result["updated"]
+        assert (mismatch / "SKILL.md").read_text().endswith("# v1\n")
+
+    def test_relocation_scan_ignores_special_and_support_directories(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            origin = skills_dir / "old-skill"
+            for parent in (
+                skills_dir / ".archive",
+                skills_dir / ".hub",
+                skills_dir / ".pytest_cache",
+                skills_dir / ".restore-backups",
+                skills_dir / "interrupted-update.bak",
+                origin / "references",
+            ):
+                candidate = parent / "old-skill"
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.mkdir()
+                (candidate / "SKILL.md").write_text((origin / "SKILL.md").read_text())
+            shutil.rmtree(origin)
+            (bundled / "old-skill" / "SKILL.md").write_text("# upstream v2\n")
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" not in result["updated"]
+        assert not (skills_dir / "old-skill").exists()
+
+    @pytest.mark.skipif(__import__("sys").platform == "win32", reason="symlink permissions vary on Windows")
+    def test_relocation_scan_rejects_symlink_escape(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        outside = tmp_path / "outside" / "old-skill"
+        outside.mkdir(parents=True)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            shutil.rmtree(skills_dir / "old-skill")
+            (outside / "SKILL.md").write_text("# old\n")
+            link_parent = skills_dir / "categorized"
+            link_parent.mkdir()
+            (link_parent / "old-skill").symlink_to(outside, target_is_directory=True)
+            (bundled / "old-skill" / "SKILL.md").write_text("# upstream v2\n")
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" not in result["updated"]
+        assert (outside / "SKILL.md").read_text() == "# old\n"
 
 
 class TestGetBundledDir:

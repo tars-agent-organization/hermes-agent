@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Owner-typed inbound text is prefixed at MessageEvent construction so transcripts stay disambiguated before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
+_DIRECT_MENTION_PREFIX = "[Directly addressed via WhatsApp mention] "
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
 
@@ -391,6 +392,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
         # Telegram cadence and ceilings (#44883); ``0`` dispatches each message immediately.
         self._configure_text_batch_delays()
+        self._active_processing_reactions: set[tuple[str, str]] = set()
+
+    def _enqueue_text_event(self, event: MessageEvent) -> None:
+        """Preserve the latest directly-admitted group message as reaction target across batching."""
+        target = self._processing_reaction_target(event) if self._should_use_group_processing_reaction(event) else None
+        key = self._text_batch_key(event)
+        super()._enqueue_text_event(event)
+        if target is not None:
+            pending = self._pending_text_batches.get(key)
+            if pending is not None:
+                pending._whatsapp_processing_reaction_target = target  # type: ignore[attr-defined]
 
     def _bridge_url(self, path: str) -> str:
         return f"http://127.0.0.1:{self._bridge_port}/{path}"
@@ -1051,7 +1063,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             cached_urls, media_types = await self._collect_bridge_media(data, msg_type)
             body = data.get("body", "")
             if data.get("isGroup"):
+                directly_mentioned = self._message_mentions_bot(data)
                 body = self._clean_bot_mention_text(body, data)
+                if directly_mentioned:
+                    body = f"{_DIRECT_MENTION_PREFIX}{body}"
             if msg_type == MessageType.VOICE and cached_urls and str(body).strip().lower() == "[ptt received]":
                 body = ""  # Bridge placeholder for captionless voice notes; the audio is the payload.
             # Quoted message stays in structured fields only — GatewayRunner renders the "[Replying to: ...]" pointer.
@@ -1069,6 +1084,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 ("whatsapp_native_type", str(data.get("nativeType") or "").strip()),
                 ("whatsapp_native", native_metadata if isinstance(native_metadata, dict) else None),
             ) if v}
+            if type(data.get("isForwarded")) is bool:
+                metadata["whatsapp_forwarded"] = data["isForwarded"]
             # ``fromOwner`` = owner-typed inbound fromMe (gated by WHATSAPP_FORWARD_OWNER_MESSAGES at the bridge); surfaced as
             # metadata AND a text prefix so the marker survives downstream failures before silent_ingest.
             if data.get("fromOwner"):
@@ -1086,6 +1103,59 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None
+
+    def _group_processing_reaction_enabled(self) -> bool:
+        value = self.config.extra.get("group_processing_reaction", False)
+        return value.strip().lower() in {"true", "1", "yes", "on"} if isinstance(value, str) else bool(value)
+
+    def _processing_reaction_target(self, event: MessageEvent) -> Optional[tuple[str, str, str]]:
+        preserved = getattr(event, "_whatsapp_processing_reaction_target", None)
+        if preserved is not None:
+            return preserved
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        chat_id = str(event.source.chat_id or raw.get("chatId") or "").strip()
+        message_id = str(event.message_id or raw.get("messageId") or "").strip()
+        participant = str(event.source.user_id or raw.get("senderId") or "").strip()
+        return (chat_id, message_id, participant) if chat_id and message_id and participant else None
+
+    def _should_use_group_processing_reaction(self, event: MessageEvent) -> bool:
+        return self._group_processing_reaction_enabled() and str(event.source.chat_type or "").lower() == "group"
+
+    async def _set_processing_reaction(self, event: MessageEvent, emoji: str) -> bool:
+        if not self._running or not self._http_session or await self._check_managed_bridge_exit():
+            return False
+        target = self._processing_reaction_target(event)
+        if target is None:
+            return False
+        chat_id, message_id, participant = target
+        try:
+            import aiohttp
+            async with self._http_session.post(
+                self._bridge_url("react"),
+                json={"chatId": to_whatsapp_jid(chat_id), "messageId": message_id,
+                      "participant": to_whatsapp_jid(participant), "emoji": emoji},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                return resp.status == 200
+        except Exception:
+            logger.debug("[%s] WhatsApp processing reaction request failed", self.name)
+            return False
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        if not self._should_use_group_processing_reaction(event):
+            return
+        target = self._processing_reaction_target(event)
+        if target is not None and await self._set_processing_reaction(event, "👀"):
+            self._active_processing_reactions.add((target[0], target[1]))
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        target = self._processing_reaction_target(event)
+        if target is None or (target[0], target[1]) not in self._active_processing_reactions:
+            return
+        try:
+            await self._set_processing_reaction(event, "")
+        finally:
+            self._active_processing_reactions.discard((target[0], target[1]))
 
 
 # ── Plugin glue: register(ctx) plus the hooks for gateway/run.py, gateway/config.py, hermes_cli/gateway.py, send_message_tool.py.
@@ -1238,6 +1308,8 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
     conversational_mode = whatsapp_cfg.get("conversational_mode")
     if isinstance(conversational_mode, dict):
         seeded["conversational_mode"] = conversational_mode
+    if "group_processing_reaction" in whatsapp_cfg:
+        seeded["group_processing_reaction"] = whatsapp_cfg["group_processing_reaction"]
     return seeded or None
 
 

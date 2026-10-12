@@ -478,6 +478,7 @@ def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
+    workload: Optional[str] = None, display_name: Optional[str] = None, display_task: Optional[str] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[dict[str, Any]] = None,
@@ -517,6 +518,9 @@ def delegate_task(
         )
 
     cfg = _load_config()
+    workload_key = str(workload or "routine").strip().lower()
+    if workload_key not in {"routine", "complex"}:
+        return tool_error("workload must be either 'routine' or 'complex'.")
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Caller-supplied max_iterations is ignored: the config value is authoritative
     # so budgets stay predictable (kwarg kept for internal callers/tests).
@@ -535,8 +539,16 @@ def delegate_task(
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
         return tool_error(str(exc))
+    if workload_key == "complex":
+        complex_model = str(cfg.get("complex_model") or "").strip()
+        if complex_model:
+            creds = dict(creds)
+            creds["model"] = complex_model
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    if not err and task_list and goal and not tasks:
+        task_list[0]["display_name"] = display_name
+        task_list[0]["display_task"] = display_task
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:
@@ -642,7 +654,9 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Model routing is workload-based. Omit workload or use routine for summaries, monitoring, cron, and "
+    "straightforward changes. Use complex only for hard multi-step engineering, deep diagnosis/research, or "
+    "high-impact planning; the operator controls both models in config.yaml."
 )
 
 def _build_tasks_param_description() -> str:
@@ -737,6 +751,12 @@ DELEGATE_TASK_SCHEMA = {
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
                         ),
+                        "display_name": _p(
+                            "string", "Optional public /agents label; never include goals, context, IDs, or private data.",
+                        ),
+                        "display_task": _p(
+                            "string", "Optional concise public /agents task; never copy goal or context here.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -759,6 +779,11 @@ DELEGATE_TASK_SCHEMA = {
                 "string",
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
+            ),
+            "workload": _p(
+                "string",
+                "Operator-configured model tier: routine (default) for ordinary background work; complex only for hard engineering, research, or planning.",
+                enum=["routine", "complex"],
             ),
         },
         "required": [],
@@ -793,6 +818,7 @@ registry.register(
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"), role=args.get("role"),
+        workload=args.get("workload"), display_name=args.get("display_name"), display_task=args.get("display_task"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_agent=kw.get("parent_agent"),

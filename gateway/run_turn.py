@@ -2054,7 +2054,9 @@ class GatewayTurnMixin:
         restore_session_yolo(session_key, session_entry.yolo is True)  # a restarted gateway's set starts empty
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(
+            context, trusted_request_metadata=getattr(event, "metadata", None),
+        )
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
@@ -4207,6 +4209,18 @@ class GatewayTurnMixin:
         _notify_adapter = self._delivery_adapter_for(source)
         if not _notify_adapter:
             return
+        _heartbeat_chat_id = source.chat_id
+        _heartbeat_metadata = _status_thread_metadata
+        if str(getattr(source, "chat_type", "") or "").lower() == "group":
+            home = self.config.get_home_channel(source.platform)
+            if not home or not home.chat_id:
+                return
+            _heartbeat_chat_id = str(home.chat_id)
+            if _heartbeat_chat_id.endswith("@g.us"):
+                return
+            _heartbeat_metadata = self._thread_metadata_for_target(
+                source.platform, _heartbeat_chat_id, home.thread_id,
+            )
         _heartbeat_msg_id: Optional[str] = None
         while True:
             await asyncio.sleep(_NOTIFY_INTERVAL)
@@ -4240,7 +4254,7 @@ class GatewayTurnMixin:
                 _notify_res = None
                 if _heartbeat_msg_id:
                     try:
-                        _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
+                        _notify_res = await _notify_adapter.edit_message(_heartbeat_chat_id, _heartbeat_msg_id, _heartbeat_text)
                     except Exception as _ee:
                         logger.debug("Heartbeat edit failed: %s", _ee)
                         _notify_res = None
@@ -4252,8 +4266,8 @@ class GatewayTurnMixin:
                     ):
                         break
                     _notify_res = await _notify_adapter.send(
-                        source.chat_id, _heartbeat_text,
-                        metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
+                        _heartbeat_chat_id, _heartbeat_text,
+                        metadata=_interim_metadata(_non_conversational_metadata(_heartbeat_metadata, platform=source.platform)),
                     )
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)

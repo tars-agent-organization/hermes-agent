@@ -1737,6 +1737,9 @@ def run_conversation(
     foreground_guard = getattr(agent, "_foreground_budget_guard", None)
     if foreground_guard is not None:
         foreground_guard.start_turn()
+        set_turn_user_message = getattr(foreground_guard, "set_turn_user_message", None)
+        if callable(set_turn_user_message):
+            set_turn_user_message(user_message)
         agent._strict_background_handoff_observed = False
         # The app-server executes tools outside Hermes, so its admission
         # deadline cannot be enforced. Fail closed when the guard is active.

@@ -8,7 +8,8 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator
+from types import MappingProxyType
+from typing import Any, Iterator, Mapping
 
 # "Never set here" (falls back to os.environ for CLI/cron) vs "" = explicitly cleared (no fallback).
 _UNSET: Any = object()
@@ -55,6 +56,10 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # Request-local proof that the client resumes SessionDB history. No env fallback
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
+
+# Adapter-originated request metadata for the current inbound event. There is
+# deliberately no environment fallback: absence is ambiguous and consumers fail closed.
+_TRUSTED_REQUEST_METADATA = ContextVar("HERMES_TRUSTED_REQUEST_METADATA", default=_UNSET)
 
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -120,6 +125,7 @@ def set_session_vars(
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None,
+    trusted_request_metadata: Mapping[str, Any] | None = None,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -140,6 +146,9 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    tokens.append(_TRUSTED_REQUEST_METADATA.set(
+        MappingProxyType(dict(trusted_request_metadata))
+        if isinstance(trusted_request_metadata, Mapping) else None))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -154,6 +163,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _TRUSTED_REQUEST_METADATA.set(None)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -167,6 +177,7 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _TRUSTED_REQUEST_METADATA.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -177,6 +188,12 @@ def get_session_env(name: str, default: str = "") -> str:
     if var is not None and (value := var.get()) is not _UNSET:
         return value
     return os.getenv(name, default)
+
+
+def get_trusted_request_metadata() -> Mapping[str, Any] | None:
+    """Immutable adapter-to-gateway metadata for this request only."""
+    value = _TRUSTED_REQUEST_METADATA.get()
+    return value if isinstance(value, Mapping) else None
 
 
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/

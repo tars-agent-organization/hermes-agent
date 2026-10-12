@@ -1136,6 +1136,8 @@ class GatewayBusySessionMixin:
             "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
             canonical_cmd, source.platform.value if source.platform else "?", source.user_id,
         )
+        if (getattr(source, "chat_type", "") or "").lower() not in {"dm", "direct", "private", ""}:
+            return ""
         allowed_preview = sorted(policy.user_allowed_commands)
         if allowed_preview:
             suffix = (

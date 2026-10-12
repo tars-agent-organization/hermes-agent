@@ -103,6 +103,17 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 if isinstance(_new_text, str):
                     event = dataclasses.replace(event, text=_new_text)
                 break
+            if _action == "invalidate_identity_projection_session":
+                requested_platform = str(_result.get("platform") or "").lower()
+                source_platform = str(source.platform.value if source.platform else "").lower()
+                scope = str(_result.get("scope") or "dm")
+                bound_group = (
+                    scope == "sender_group" and source.chat_type == "group"
+                    and bool(source.user_id) and bool(source.chat_id)
+                )
+                if requested_platform == source_platform and (source.chat_type == "dm" or bound_group):
+                    event._identity_projection_invalidation = _result
+                continue
             if _action == "allow":
                 break
         return event
@@ -255,6 +266,26 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             else:
                 logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             return None
+        invalidation = getattr(event, "_identity_projection_invalidation", None)
+        if isinstance(invalidation, dict):
+            quick_key = self._session_key_for_source(source)
+            detached = await self.async_session_store.detach_session(
+                quick_key, reason="identity_projection_rotation",
+            )
+            if not detached:
+                logger.warning("identity projection rotation failed closed")
+                return None
+            self._evict_cached_agent(quick_key)
+            getattr(self, "_session_model_overrides", {}).pop(quick_key, None)
+            self._set_session_reasoning_override(quick_key, None)
+            getattr(self, "_pending_model_notes", {}).pop(quick_key, None)
+            getattr(self, "_last_resolved_model", {}).pop(quick_key, None)
+            commit = invalidation.get("commit")
+            if callable(commit):
+                try:
+                    commit()
+                except Exception:
+                    logger.warning("identity projection revision commit failed")
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
@@ -599,16 +630,22 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
         if _cmd_def_inner:
-            # /status and /context are intentionally pre-gate so users always see session state.
-            if _cmd_def_inner.name == "status":
+            # DMs keep universal status/context visibility. In groups these
+            # commands pass the owner policy and denials remain silent.
+            _is_dm = (getattr(source, "chat_type", "") or "").lower() in {"dm", "direct", "private", ""}
+            if _cmd_def_inner.name == "status" and _is_dm:
                 return True, await self._handle_status_command(event)
-            if _cmd_def_inner.name == "context":
+            if _cmd_def_inner.name == "context" and _is_dm:
                 return True, await self._handle_context_command(event)
             # Slash access control mirrors the cold-path gate so non-admins can't bypass gating
             # just because an agent is busy. /help and /whoami are the always-allowed floor.
             _denied = self._check_slash_access(source, _cmd_def_inner.name)
             if _denied is not None:
                 return True, _denied
+            if _cmd_def_inner.name == "status":
+                return True, await self._handle_status_command(event)
+            if _cmd_def_inner.name == "context":
+                return True, await self._handle_context_command(event)
             # Any recognized slash command dispatches per its declared busy_policy (dispatch /
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)

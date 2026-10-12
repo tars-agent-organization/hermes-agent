@@ -685,6 +685,14 @@ def _emit_post_tool_call_hook(
     if _post_tool_call_hook_suppressed.get():
         return
     try:
+        # ContextVar-scoped observer: only the normalized tool category is
+        # recorded, never arguments, results, identifiers, or errors.
+        if status not in {"blocked", "cancelled"}:
+            from agent.provenance import record_tool_call
+            record_tool_call(function_name)
+    except Exception:
+        pass
+    try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
             return

@@ -1156,6 +1156,37 @@ class SessionStore(
         )
         return new_entry
 
+    def detach_session(self, session_key: str, *, reason: str) -> bool:
+        """End and durably detach one routing lane without publishing a replacement."""
+        if not session_key or not reason:
+            return False
+        with self._lock:
+            old_entry = self._entry_locked(session_key)
+        if old_entry is None:
+            return True
+        if self._db:
+            try:
+                self._db.end_session(old_entry.session_id, reason)
+                row = self._db.get_session(old_entry.session_id)
+                if row is None or row.get("end_reason") != reason:
+                    return False
+            except Exception:
+                logger.warning("gateway.session: durable identity-session detach failed")
+                return False
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is None:
+                return True
+            if current.session_id != old_entry.session_id:
+                return False
+            self._entries.pop(session_key, None)
+            try:
+                self._save()
+            except Exception:
+                logger.warning("gateway.session: routing detach persistence failed")
+                return False
+        return True
+
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
         """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held."""
         new_entry = SessionEntry(

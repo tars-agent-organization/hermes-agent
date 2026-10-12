@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -90,6 +91,22 @@ def test_group_messages_can_require_direct_trigger_via_config():
         )
     ) is True
     assert adapter._should_process_message(_group_message("/status")) is True
+
+
+def test_native_bot_mention_remains_explicit_in_agent_text():
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    event = asyncio.run(
+        adapter._build_message_event(
+            _group_message(
+                "@15551230000 ?",
+                mentionedIds=["15551230000@s.whatsapp.net"],
+            )
+        )
+    )
+
+    assert event is not None
+    assert event.text == "[Directly addressed via WhatsApp mention] ?"
 
 
 def test_regex_mention_patterns_allow_custom_wake_words():

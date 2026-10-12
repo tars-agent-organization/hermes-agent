@@ -1,0 +1,27 @@
+{
+  "now": 1700000000000,
+  "allowedChannelIds": ["sports@example.newsletter"],
+  "allowedDestinationIds": ["origin@example.test", "group@example.test"],
+  "subscription": {
+    "gameId": "lions-v-tigers",
+    "channelId": "sports@example.newsletter",
+    "originChatId": "origin@example.test",
+    "aliases": ["Lions", "Tigers"],
+    "startsAt": 1699999940000,
+    "expiresAt": 1700000060000
+  },
+  "posts": [
+    {
+      "key": { "id": "sanitized-channel-post-1", "remoteJid": "sports@example.newsletter" },
+      "messageTimestamp": 1700000000,
+      "message": {
+        "videoMessage": { "caption": "Lions score!", "mimetype": "video/mp4" }
+      }
+    }
+  ],
+  "extracted": {
+    "hasMedia": true,
+    "mediaUrls": ["/sanitized/no-real-media.mp4"],
+    "body": "Lions score!"
+  }
+}

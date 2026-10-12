@@ -93,6 +93,9 @@ DEFAULT_CONFIG = {
         # A successful detached delegate_task immediately closes the parent turn
         # on these platforms and returns the deterministic acknowledgment below.
         "strict_background_handoff_platforms": [],
+        # Platforms where top-level delegate_task calls are rejected so the
+        # active agent must finish the user's request in the current turn.
+        "disable_background_delegation_platforms": [],
         "strict_background_handoff_ack": (
             "I'm checking this in the background and will return here with the result."
         ),

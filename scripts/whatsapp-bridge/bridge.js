@@ -33,9 +33,12 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedSender, matchesAllowedUser, matchesInboundWhatsAppGroup, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createNewsletterRouter, parseNewsletterAllowlist, processNewsletterUpsert } from './newsletter_router.js';
+import { deliverNewsletterMedia } from './newsletter_delivery.js';
 import {
   addMentions,
   buildPollPayload,
+  buildReactionPayload,
   createReconnectScheduler,
   createVersionResolver,
   installConsoleStamps,
@@ -44,6 +47,7 @@ import {
   createBoundedMessageStore,
   createQuotedMediaCache,
   extractBridgeEvent,
+  getContextInfo,
   getMessageContent,
   inboundReadReceiptKeys,
   inferMediaType,
@@ -123,6 +127,8 @@ const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); 
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const WHATSAPP_GROUP_POLICY = String(process.env.WHATSAPP_GROUP_POLICY || 'pairing').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+const NEWSLETTER_ALLOWED_CHANNELS = parseNewsletterAllowlist(process.env.WHATSAPP_CHANNEL_ALLOWLIST);
+const NEWSLETTER_ALLOWED_DESTINATIONS = parseNewsletterAllowlist(process.env.WHATSAPP_CHANNEL_DESTINATION_ALLOWLIST);
 // Group authorization is by group JID, not by every participant's JID.  The
 // Python adapter still applies group policy and mention rules after intake.
 const GROUP_ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_GROUP_ALLOWED_USERS || '');
@@ -256,6 +262,10 @@ const logger = pino({ level: 'warn' });
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
+const newsletterRouter = createNewsletterRouter({
+  allowedChannelIds: NEWSLETTER_ALLOWED_CHANNELS,
+  allowedDestinationIds: NEWSLETTER_ALLOWED_DESTINATIONS,
+});
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -525,6 +535,28 @@ async function startSocket() {
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
 
+    await processNewsletterUpsert({
+      type,
+      messages,
+      router: newsletterRouter,
+      extractEvent: async (msg) => extractBridgeEvent({
+        msg,
+        chatId: 'whatsapp-channel',
+        senderId: 'whatsapp-channel',
+        senderNumber: 'WhatsApp Channel',
+        botIds: [],
+        isGroup: false,
+        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+        cacheDirs: { image: IMAGE_CACHE_DIR, document: DOCUMENT_CACHE_DIR, audio: AUDIO_CACHE_DIR },
+      }),
+      deliverMedia: (delivery) => deliverNewsletterMedia({
+        delivery,
+        readFile: readFileSync,
+        send: (chatId, payload) => sendWithTimeout(chatId, payload),
+        trackSentMessageId,
+      }),
+    });
+
     const botIds = Array.from(new Set([
       normalizeWhatsAppId(sock.user?.id),
       normalizeWhatsAppId(sock.user?.lid),
@@ -532,6 +564,7 @@ async function startSocket() {
 
     for (const msg of messages) {
       if (!msg.message) continue;
+      if (String(msg.key?.remoteJid || '').toLowerCase().endsWith('@newsletter')) continue;
 
       const chatId = msg.key.remoteJid;
       const senderId = msg.key.participant || chatId;
@@ -742,6 +775,10 @@ async function startSocket() {
         lookupQuotedMedia: (quotedChatId, quotedMessageId) => quotedMediaCache.get(quotedChatId, quotedMessageId),
       });
       event.fromOwner = fromOwner;
+      const forwardContext = getContextInfo(getMessageContent(msg));
+      event.isForwarded = Boolean(
+        forwardContext?.isForwarded || Number(forwardContext?.forwardingScore || 0) > 0
+      );
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
@@ -837,6 +874,20 @@ app.get('/messages', (req, res) => {
   res.json(msgs);
 });
 
+app.post('/newsletter/subscriptions', (req, res) => {
+  try {
+    const subscription = newsletterRouter.register(req.body);
+    res.status(201).json({ subscriptionId: subscription.id, gameId: subscription.gameId, expiresAt: subscription.expiresAt });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/newsletter/subscriptions/:id', (req, res) => {
+  const removed = newsletterRouter.remove(req.params.id);
+  res.status(removed ? 204 : 404).end();
+});
+
 // Send a message
 app.post('/send', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
@@ -906,6 +957,27 @@ app.post('/edit', async (req, res) => {
     }
 
     res.json({ success: true, messageIds });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, messageId, participant, emoji } = req.body || {};
+  if (!chatId || !messageId || typeof emoji !== 'string') {
+    return res.status(400).json({ error: 'chatId, messageId, and emoji are required' });
+  }
+  if (String(chatId).endsWith('@g.us') && !participant) {
+    return res.status(400).json({ error: 'participant is required for group reactions' });
+  }
+  try {
+    const payload = buildReactionPayload({ chatId, messageId, participant, emoji });
+    const sent = await sendWithTimeout(chatId, payload);
+    trackSentMessageId(sent);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

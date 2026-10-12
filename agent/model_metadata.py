@@ -1903,6 +1903,13 @@ def _fetch_codex_oauth_context_lengths_with_source(access_token: str, base_url: 
     for item in entries:
         slug, ctx, max_ctx = (item.get("slug"), item.get("context_window"), item.get("max_context_window")) if isinstance(item, dict) else (None, None, None)
         if isinstance(slug, str) and isinstance(ctx, int) and ctx > 0:
+            effective_percent = item.get("effective_context_window_percent")
+            if (
+                isinstance(effective_percent, (int, float))
+                and not isinstance(effective_percent, bool)
+                and 0 < effective_percent <= 100
+            ):
+                ctx = int(ctx * effective_percent / 100)
             result[slug.strip()] = ctx
             if isinstance(max_ctx, int) and max_ctx > 0:
                 max_result[slug.strip()] = max_ctx

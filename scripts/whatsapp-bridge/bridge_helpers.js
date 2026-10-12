@@ -237,6 +237,16 @@ export function buildTextSendPayload(text, { replyTo, messageStore, mentions } =
   return { content, options };
 }
 
+export function buildReactionPayload({ chatId, messageId, participant, emoji = '' } = {}) {
+  const remoteJid = normalizeWhatsAppId(chatId);
+  const id = String(messageId || '').trim();
+  if (!remoteJid || !id) throw new Error('chatId and messageId are required');
+  const key = { remoteJid, id, fromMe: false };
+  const normalizedParticipant = normalizeWhatsAppId(participant);
+  if (normalizedParticipant) key.participant = normalizedParticipant;
+  return { react: { text: String(emoji ?? ''), key } };
+}
+
 export function buildLocationPayload({ latitude, longitude, name, address } = {}) {
   const lat = Number(latitude);
   const lon = Number(longitude);

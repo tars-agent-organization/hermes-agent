@@ -73,7 +73,14 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
     runner._agent_cache_lock = MagicMock()
     runner._show_reasoning = False
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env_calls = []
+
+    def _set_session_env(_context, *, trusted_request_metadata=None):
+        tokens = []
+        runner._set_session_env_calls.append((trusted_request_metadata, tokens))
+        return tokens
+
+    runner._set_session_env = _set_session_env
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
@@ -391,13 +398,393 @@ async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
             ]
 
     monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    monkeypatch.setattr("tools.async_delegation.active_count", lambda: 0)
 
     result = await runner._handle_message(_make_event("/agents"))
 
-    assert "**Active agents:** 1" in result
+    assert "**Active delegated agents:**" not in result
     assert "**Running background processes:** 1" in result
-    assert "proc-1" in result
+    assert "proc-1" not in result
+    assert "sleep 30" not in result
+    assert "sess-running" not in result
+    assert session_key not in result
     running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agents_command_aggregates_delegations_from_other_profile_without_details(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner.config.multiplex_profiles = True
+    runner._background_tasks = set()
+
+    class _FakeRegistry:
+        def list_sessions(self):
+            return []
+
+    monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    import tools.async_delegation as async_delegation
+
+    monkeypatch.setattr(
+        async_delegation,
+        "_records",
+        {
+            "deleg_other_profile": {
+                "status": "running",
+                "session_key": "agent:other:telegram:dm:private",
+            },
+            "deleg_other_session": {
+                "status": "finalizing",
+                "session_key": "agent:main:telegram:dm:elsewhere",
+            },
+        },
+    )
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert "**Active delegated agents:** 2" in result
+    assert "**Gateway async jobs:**" not in result
+    assert "deleg_" not in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_counts_local_agent_background_task_and_delegation_once(monkeypatch):
+    session_key = build_session_key(_make_source())
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._running_agents[session_key] = SimpleNamespace(session_id="local-session-secret")
+    background_task = MagicMock()
+    background_task.done.return_value = False
+    runner._background_tasks = {background_task}
+
+    class _FakeRegistry:
+        def list_sessions(self):
+            return []
+
+    monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    import tools.async_delegation as async_delegation
+
+    monkeypatch.setattr(
+        async_delegation,
+        "_records",
+        {
+            "delegation-secret": {
+                "status": "running",
+                "session_key": "agent:other:telegram:dm:private",
+            },
+        },
+    )
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert result is not None
+    assert "**Active delegated agents:** 1" in result
+    assert "**Gateway async jobs:** 1" in result
+    assert session_key not in result
+    assert "local-session-secret" not in result
+    assert "delegation-secret" not in result
+    assert "agent:other:telegram:dm:private" not in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_lists_live_delegated_workers_separately_and_excludes_completed(monkeypatch):
+    """A canonical snapshot expands a live batch into workers, never async jobs."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = {MagicMock(done=lambda: False)}
+
+    class _FakeRegistry:
+        def list_sessions(self):
+            return [{
+                "session_id": "proc_abcdef123456",
+                "status": "running",
+                "uptime_seconds": 17,
+                "command": "curl https://secret.example --token private-token",
+            }]
+
+    monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    import tools.async_delegation as async_delegation
+
+    now = time.time()
+    monkeypatch.setattr(
+        async_delegation,
+        "_records",
+        {
+            "deleg_abcdef12": {
+                "delegation_id": "deleg_abcdef12",
+                "status": "running",
+                "goal": "Review deployment token=private-token",
+                "display_name": "Fix Triage",
+                "display_task": "Map live state",
+                "dispatched_at": now - 65,
+            },
+            "deleg_batch1234": {
+                "delegation_id": "deleg_batch1234",
+                "status": "running",
+                "is_batch": True,
+                "goals": ["Check API", "Audit docs"],
+                "display_names": ["Security", "Integration"],
+                "display_tasks": ["Review API", "Audit documentation"],
+                "dispatched_at": now - 17,
+            },
+            "deleg_completed": {
+                "delegation_id": "deleg_completed",
+                "status": "completed",
+                "goal": "must not appear",
+                "dispatched_at": now - 100,
+            },
+        },
+    )
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert "**Active delegated agents:** 3" in result
+    assert "Fix Triage · Map live state · running" in result
+    assert "Security · Review API" in result
+    assert "Integration · Audit documentation" in result
+    assert "private-token" not in result
+    assert "must not appear" not in result
+    assert "**Running background processes:** 1" in result
+    assert "`proc…3456` · running" in result
+    assert "curl" not in result
+    assert "**Gateway async jobs:** 1" in result
+    assert "deleg…atch" not in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_projects_only_public_metadata_for_live_single_batch_and_legacy_records(monkeypatch):
+    """The gateway must not derive its public rows from raw delegation data."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()), session_id="sess-1",
+        created_at=datetime.now(), updated_at=datetime.now(),
+        platform=Platform.TELEGRAM, chat_type="dm", total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+
+    class _FakeRegistry:
+        def list_sessions(self):
+            return []
+
+    monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    import tools.async_delegation as async_delegation
+
+    raw_secret = "token=private-token https://secret.example /private/path jane@example.com +1 555 555 5555"
+    monkeypatch.setattr(async_delegation, "_records", {
+        "deleg_single_private_handle": {
+            "delegation_id": "deleg_single_private_handle", "status": "running",
+            "goal": f"raw goal {raw_secret}", "context": f"raw context {raw_secret}",
+            "display_name": "Fix\n*Triage*",
+            "display_task": "Map [live](https://evil.example) state\x00 " + "x" * 120,
+            "dispatched_at": time.time() - 10,
+        },
+        "deleg_batch_private_handle": {
+            "delegation_id": "deleg_batch_private_handle", "status": "finalizing", "is_batch": True,
+            "goals": [f"raw child one {raw_secret}", f"raw child two {raw_secret}"],
+            "display_names": ["Security", "Integration"],
+            "display_tasks": ["Review privacy boundary", "Check lifecycle"],
+            "dispatched_at": time.time() - 20,
+        },
+        "deleg_legacy_private_handle": {
+            "delegation_id": "deleg_legacy_private_handle", "status": "running",
+            "goal": f"legacy raw goal {raw_secret}", "context": f"legacy raw context {raw_secret}",
+            "dispatched_at": time.time() - 30,
+        },
+        "deleg_terminal_private_handle": {
+            "delegation_id": "deleg_terminal_private_handle", "status": "completed",
+            "display_name": "Completed agent", "display_task": "must not appear",
+            "goal": f"terminal raw goal {raw_secret}", "dispatched_at": time.time() - 40,
+        },
+    })
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert "**Active delegated agents:** 4" in result
+    assert result.count("Delegated agent · Task in progress") == 2
+    assert "Security · Review privacy boundary" in result
+    assert "Integration · Check lifecycle" in result
+    assert "x" * 97 not in result
+    for forbidden in (
+        "deleg_", "private-token", "secret.example", "/private/path",
+        "jane@example.com", "555 555", "raw goal", "raw context",
+        "must not appear", "Completed agent", "[live]", "https://evil.example",
+    ):
+        assert forbidden not in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_falls_back_for_adversarial_public_metadata(monkeypatch):
+    """The renderer repeats provenance checks for legacy/in-memory records."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()), session_id="sess-1",
+        created_at=datetime.now(), updated_at=datetime.now(),
+        platform=Platform.TELEGRAM, chat_type="dm", total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry", type("Registry", (), {"list_sessions": lambda _self: []})()
+    )
+    import tools.async_delegation as async_delegation
+
+    goal = "Review private deployment credentials before production release"
+    monkeypatch.setattr(async_delegation, "_records", {
+        "copy": {
+            "status": "running", "goal": goal, "context": "confidential",
+            "display_name": "Security", "display_task": "Review private deployment",
+            "dispatched_at": time.time() - 3,
+        },
+        "syntax": {
+            "status": "running", "goal": "Audit release", "context": None,
+            "display_name": "Audit\u202e", "display_task": r"MarkdownV2 \\ _ * [ ] ( ) ~ ` > # + - = | { } . !\u200b",
+            "dispatched_at": time.time() - 2,
+        },
+    })
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert "Security · Task in progress · running" in result
+    assert result.count("Delegated agent · Task in progress") == 1
+    for unsafe in ("Review private deployment", "MarkdownV2", "\u202e", "\u200b"):
+        assert unsafe not in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_keeps_safe_public_siblings_and_hides_rejected_fields(monkeypatch):
+    """Legacy snapshot revalidation applies independent fallbacks without raw leakage."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()), session_id="sess-1",
+        created_at=datetime.now(), updated_at=datetime.now(),
+        platform=Platform.TELEGRAM, chat_type="dm", total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry", type("Registry", (), {"list_sessions": lambda _self: []})()
+    )
+    import tools.async_delegation as async_delegation
+
+    copied_task = "Revisar credenciais privadas"
+    monkeypatch.setattr(async_delegation, "_records", {
+        "single": {
+            "status": "running", "goal": "Revisar credenciais privadas antes da liberação de produção",
+            "context": "confidencial", "display_name": "Análise", "display_task": copied_task,
+            "dispatched_at": time.time() - 3,
+        },
+        "batch": {
+            "status": "running", "is_batch": True, "goals": ["Auditar métricas", "Preparar relatório"],
+            "display_names": ["Nome\u202e", "Operações"],
+            "display_tasks": ["Sintetizar resultados", "token=synthetic-secret"],
+            "dispatched_at": time.time() - 2,
+        },
+    })
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert "Análise · Task in progress · running" in result
+    assert "Delegated agent · Sintetizar resultados · running" in result
+    assert "Operações · Task in progress · running" in result
+    for private in (copied_task, "synthetic-secret", "Nome\u202e"):
+        assert private not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot", "present", "absent"),
+    [
+        (
+            {
+                "delegated_agents": [
+                    {"display_name": "Docs", "display_task": "Check documentation", "status": "running", "elapsed_seconds": 10}
+                ],
+                "processes": [],
+                "async_jobs": [],
+            },
+            ["**Active delegated agents:** 1"],
+            ["**Running background processes:**", "**Gateway async jobs:**", "- none", "Nenhum agente"],
+        ),
+        (
+            {
+                "delegated_agents": [],
+                "processes": [{"handle": "proc…1234", "status": "running", "elapsed_seconds": 10}],
+                "async_jobs": [],
+            },
+            ["**Running background processes:** 1"],
+            ["**Active delegated agents:**", "**Gateway async jobs:**", "- none", "Nenhum agente"],
+        ),
+        (
+            {
+                "delegated_agents": [],
+                "processes": [],
+                "async_jobs": [{"category": "gateway task", "status": "running"}],
+            },
+            ["**Gateway async jobs:** 1"],
+            ["**Active delegated agents:**", "**Running background processes:**", "- none", "Nenhum agente"],
+        ),
+        (
+            {
+                "delegated_agents": [
+                    {"display_name": "Docs", "display_task": "Check documentation", "status": "running", "elapsed_seconds": 10}
+                ],
+                "processes": [{"handle": "proc…1234", "status": "running", "elapsed_seconds": 10}],
+                "async_jobs": [{"category": "gateway task", "status": "running"}],
+            },
+            ["**Active delegated agents:** 1", "**Running background processes:** 1", "**Gateway async jobs:** 1"],
+            ["- none", "Nenhum agente"],
+        ),
+        (
+            {"delegated_agents": [], "processes": [], "async_jobs": []},
+            ["No active agents or running tasks."],
+            ["**Active delegated agents:**", "**Running background processes:**", "**Gateway async jobs:**", "- none"],
+        ),
+    ],
+)
+async def test_agents_command_omits_empty_activity_sections(monkeypatch, snapshot, present, absent):
+    """Only live activity sources render; an all-idle snapshot has one neutral line."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    monkeypatch.setattr("gateway.activity_snapshot.build_activity_snapshot", lambda _runner: snapshot)
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert "Active Agents & Tasks" in result
+    for value in present:
+        assert value in result
+    assert [result.index(value) for value in present] == sorted(result.index(value) for value in present)
+    for value in absent:
+        assert value not in result
 
 
 @pytest.mark.asyncio
@@ -420,9 +807,59 @@ async def test_tasks_alias_routes_to_agents_command(monkeypatch):
 
     monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
 
+    agents_result = await runner._handle_message(_make_event("/agents"))
     result = await runner._handle_message(_make_event("/tasks"))
 
     assert "Active Agents & Tasks" in result
+    assert result == agents_result
+
+
+@pytest.mark.asyncio
+async def test_handle_message_forwards_trusted_request_metadata_to_session_env(monkeypatch):
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.session_store.load_transcript.return_value = [{"role": "user", "content": "earlier"}]
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "model": "openai/test-model",
+        }
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+    metadata = {"trusted_ingress": "fixture-contract"}
+    event = MessageEvent(
+        text="hello",
+        source=_make_source(),
+        message_id="m1",
+        metadata=metadata,
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert len(runner._set_session_env_calls) == 1
+    received_metadata, returned_tokens = runner._set_session_env_calls[0]
+    assert received_metadata is metadata
+    assert returned_tokens == []
 
 
 @pytest.mark.asyncio

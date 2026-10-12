@@ -140,6 +140,30 @@ def test_guard_factory_enables_strict_handoff_only_for_selected_platform() -> No
     assert telegram.strict_background_handoff is False
 
 
+def test_guard_factory_disables_background_delegation_only_for_selected_platform() -> None:
+    from agent.foreground_budget import foreground_budget_guard_from_config
+
+    config = {
+        "agent": {
+            "disable_background_delegation_platforms": ["slack"],
+        }
+    }
+
+    slack = foreground_budget_guard_from_config(
+        config,
+        gateway_session_key="agent:main:slack:group:C123:thread",
+        platform="slack",
+    )
+    whatsapp = foreground_budget_guard_from_config(
+        config,
+        gateway_session_key="agent:main:whatsapp:dm:123",
+        platform="whatsapp",
+    )
+
+    assert slack.background_delegation_disabled is True
+    assert whatsapp.background_delegation_disabled is False
+
+
 def test_strict_handoff_latches_successful_dispatch_before_deadline() -> None:
     clock = FakeClock()
     guard = ForegroundBudgetGuard(
@@ -162,6 +186,31 @@ def test_strict_handoff_latches_successful_dispatch_before_deadline() -> None:
     assert decision.code == "foreground_handoff_already_started"
     assert guard.consume_strict_handoff_ack() == "Working in background."
     assert guard.consume_strict_handoff_ack() is None
+
+
+def test_sequential_executor_blocks_background_delegation_for_inline_platform(
+    monkeypatch,
+) -> None:
+    from agent.tool_executor import execute_tool_calls_sequential
+
+    guard = ForegroundBudgetGuard(0, background_delegation_disabled=True)
+    guard.start_turn()
+    agent = FakeAgent(guard)
+    agent.valid_tool_names.add("delegate_task")
+    agent._dispatch_delegate_task = MagicMock(
+        return_value='{"status":"dispatched","delegation_id":"deleg_1"}'
+    )
+    messages = []
+    assistant = SimpleNamespace(
+        tool_calls=[FakeToolCall("delegate_task", {"goal": "background"})]
+    )
+
+    execute_tool_calls_sequential(agent, assistant, messages, "task")
+
+    agent._dispatch_delegate_task.assert_not_called()
+    result = json.loads(messages[0]["content"])
+    assert result["error"] == "background_delegation_disabled"
+    assert result["status"] == "blocked"
 
 
 def test_sequential_executor_stops_same_batch_after_strict_dispatch(monkeypatch) -> None:

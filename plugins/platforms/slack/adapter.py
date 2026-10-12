@@ -1775,6 +1775,11 @@ class SlackAdapter(BasePlatformAdapter):
         self._warn_if_inchannel_without_flat_reply(team_name)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Serialize every Socket Mode replacement to avoid zombie handlers."""
+        async with self._socket_reconnect_lock:
+            return await self._connect_locked(is_reconnect=is_reconnect)
+
+    async def _connect_locked(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
             logger.error("[Slack] slack-bolt not installed. Run: pip install slack-bolt")
@@ -1899,6 +1904,11 @@ class SlackAdapter(BasePlatformAdapter):
         return None
 
     async def disconnect(self) -> None:
+        """Disconnect while excluding a concurrent Socket Mode replacement."""
+        async with self._socket_reconnect_lock:
+            await self._disconnect_locked()
+
+    async def _disconnect_locked(self) -> None:
         """Disconnect from Slack."""
         self._running = False
         # Seal dangling native streams so no live-typing indicator survives a restart.
@@ -4327,6 +4337,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def _hydrate_thread_context(
         self, *, channel_id: str, event_thread_ts, ts: str, user_id: str, team_id: str,
         is_thread_reply: bool, is_mentioned: bool, is_dm: bool,
+        requests_thread_analysis: bool = False,
     ) -> tuple[Optional[str], list[str], list[str]]:
         """``(channel_context, root_media_urls, root_media_types)`` for a thread reply. No session:
         full thread + root images once, set watermark. Session + @mention: delta past watermark
@@ -4362,7 +4373,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         watermark_args = dict(
             channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id)
-        if not has_active_thread_session:
+        if requests_thread_analysis:
+            await _fetch(limit=self._thread_analysis_context_limit(), refresh=True)
+        elif not has_active_thread_session:
             await _fetch()
             (
                 thread_root_media_urls, thread_root_media_types,
@@ -4628,6 +4641,9 @@ class SlackAdapter(BasePlatformAdapter):
             or self._slack_message_matches_mention_patterns(routing_text))
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        requests_thread_analysis = bool(
+            is_thread_reply and self._requests_thread_analysis(routing_text)
+        )
         # Internal triggers (reactions) skip the mention requirement but NOT
         # allowed_channels or user authorization.
         force_process = bool(event.get("_hermes_force_process"))
@@ -4657,7 +4673,7 @@ class SlackAdapter(BasePlatformAdapter):
         ) = await self._hydrate_thread_context(
             channel_id=channel_id, event_thread_ts=event_thread_ts, ts=ts, user_id=user_id,
             team_id=team_id, is_thread_reply=is_thread_reply, is_mentioned=is_mentioned,
-            is_dm=is_dm)
+            is_dm=is_dm, requests_thread_analysis=requests_thread_analysis)
         # Thread-root media is delivered ahead of the trigger message's own files.
         media_urls, media_types, media_text_inlined, text = await self._collect_inbound_media(
             event, channel_id, team_id, text, thread_root_media_urls, thread_root_media_types)
@@ -4671,7 +4687,7 @@ class SlackAdapter(BasePlatformAdapter):
                 addressed=is_one_to_one_dm or is_mentioned or is_command_text or force_process))
         # React only when directly addressed; MPIMs are shared, so they need a
         # mention like any channel.
-        if (is_one_to_one_dm or is_mentioned) and self._reactions_enabled():
+        if (is_one_to_one_dm or is_thread_reply or is_mentioned) and self._reactions_enabled():
             self._track_reacting_message(team_id, ts)
         # App-context is per-turn UI state: in the user message, not SessionSource (would rebuild
         # the agent per view switch and leak stale context). Inert label, never a channel body.
@@ -5789,7 +5805,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _fetch_thread_context(
         self, channel_id: str, thread_ts: str, current_ts: str, team_id: str = "", limit: int = 30,
-        after_ts: str = "", force_refresh: bool = False) -> str:
+        after_ts: str = "", force_refresh: bool = False, refresh: bool = False) -> str:
         """Prior thread messages as formatted context ("" on failure/empty). Cold-start only
         (session history holds them afterwards); ``after_ts`` = session watermark returns only
         unseen messages; ``force_refresh`` bypasses the _THREAD_CACHE_TTL cache (Tier 3 API).
@@ -5799,6 +5815,7 @@ class SlackAdapter(BasePlatformAdapter):
         """
         cache_key = self._thread_cache_key(channel_id, thread_ts, team_id)
         now = time.monotonic()
+        force_refresh = force_refresh or refresh
         cached = None if force_refresh else self._thread_context_cache.get(cache_key)
         _fmt = functools.partial(
             self._format_thread_context, thread_ts=thread_ts, current_ts=current_ts,
@@ -5813,7 +5830,7 @@ class SlackAdapter(BasePlatformAdapter):
             result = await self._conversations_replies_with_backoff(
                 channel_id,
                 thread_ts,
-                limit + 1,
+                min(200, limit + 1),
                 team_id,  # +1: includes the current message
             )
             if result is None:
@@ -6483,6 +6500,29 @@ class SlackAdapter(BasePlatformAdapter):
     def _slack_message_matches_mention_patterns(self, text: str) -> bool:
         """Return True when ``text`` matches a configured wake-word pattern."""
         return bool(text) and any(p.search(text) for p in self._slack_mention_patterns())
+
+    def _thread_analysis_context_limit(self) -> int:
+        """Maximum Slack messages injected for an explicit thread review."""
+        raw = self.config.extra.get("thread_analysis_context_limit", 200)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 200
+        return max(30, min(value, 200))
+
+    @staticmethod
+    def _requests_thread_analysis(text: str) -> bool:
+        """Detect an explicit request to summarize or analyze the current thread."""
+        if not text:
+            return False
+        lowered = text.lower()
+        thread_scope = re.search(r"\b(?:thread|conversa|discuss[aã]o|debate)\b", lowered)
+        review_action = re.search(
+            r"\b(?:analis\w*|resum\w*|sintetiz\w*|atualiz\w*|summari[sz]\w*|analy[sz]\w*|recap\w*)\b",
+            lowered,
+        )
+        discussed = re.search(r"\b(?:o que (?:foi|est[aá] sendo) discutido|what was discussed)\b", lowered)
+        return bool(thread_scope and (review_action or discussed))
 
 
 # ── Plugin entry point + hooks (register, _standalone_send, interactive_setup,
