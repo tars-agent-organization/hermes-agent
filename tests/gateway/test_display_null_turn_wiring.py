@@ -12,6 +12,7 @@ import types
 
 import pytest
 
+from gateway.config import Platform
 from gateway.run_turn_runner import TurnRunner
 
 
@@ -33,7 +34,7 @@ def _wire(user_config):
         _status_adapter=None,
         session_key="",
         user_config=user_config,
-        source=types.SimpleNamespace(platform="telegram"),
+        source=types.SimpleNamespace(platform=Platform.TELEGRAM),
         mute_notification_reply=False,
         _thinking_enabled=False,
         agent_holder=[None],
@@ -67,3 +68,15 @@ def test_null_or_missing_display_falls_back_to_on(user_config):
 def test_memory_notifications_setting_still_applies():
     agent = _wire({"display": {"memory_notifications": "verbose"}})
     assert agent.memory_notifications == "verbose"
+
+
+def test_platform_memory_notifications_override_wins():
+    agent = _wire(
+        {
+            "display": {
+                "memory_notifications": "verbose",
+                "platforms": {"telegram": {"memory_notifications": False}},
+            }
+        }
+    )
+    assert agent.memory_notifications == "off"

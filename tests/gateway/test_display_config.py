@@ -127,6 +127,12 @@ class TestYAMLNormalisation:
         config = {"display": {"platforms": {"whatsapp": {"thinking_progress": "false"}}}}
         assert resolve_display_setting(config, "whatsapp", "thinking_progress") is False
 
+    def test_memory_notifications_false_normalised_to_off_per_platform(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"platforms": {"whatsapp": {"memory_notifications": False}}}}
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
+
 # ---------------------------------------------------------------------------
 # Built-in platform defaults (tier system)
 # ---------------------------------------------------------------------------

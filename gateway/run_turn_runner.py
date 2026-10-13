@@ -1277,8 +1277,10 @@ class TurnRunner:
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
         agent.notice_clear_callback = None  # sends can't be retracted
+        from gateway.display_config import resolve_display_setting
         from gateway.run import _context_notifications_enabled, _platform_config_key
-        if _context_notifications_enabled(ctx.user_config, _platform_config_key(ctx.source.platform)):
+        platform_key = _platform_config_key(ctx.source.platform)
+        if _context_notifications_enabled(ctx.user_config, platform_key):
             def _context_usage_callback(sample: dict) -> None:
                 try:
                     from gateway.context_occupancy import ContextOccupancyMonitor
@@ -1322,13 +1324,11 @@ class TurnRunner:
                 pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
                 if pdc is not None:
                     pdc[ctx.session_key] = bg_release
-        # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
-        # `display:` present-but-null yields None, not the {} default (same `or {}` guard as
-        # display_config.py / runtime_footer.py).
-        mem_notif = (ctx.user_config.get("display") or {}).get("memory_notifications")
-        if isinstance(mem_notif, bool):
-            mem_notif = "on" if mem_notif else "off"
-        agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
+        # Global or display.platforms.<platform> override; the review and approval gate remain active
+        # when notifications are off.
+        agent.memory_notifications = resolve_display_setting(
+            ctx.user_config, platform_key, "memory_notifications", "on",
+        )
         agent.clarify_callback = self._clarify_callback_sync
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).
