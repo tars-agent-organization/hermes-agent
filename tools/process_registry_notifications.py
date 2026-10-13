@@ -225,6 +225,11 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         "on siblings, end your turn after acting on this one.",
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
+    if evt.get("completion_reply_expected"):
+        lines.append(
+            "This completes user-requested background work. Send the useful result to the user now; "
+            "do not return NO_REPLY and do not merely acknowledge completion."
+        )
     lines += _recovery_lines(evt)
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {evt['error']}"]
@@ -296,6 +301,11 @@ def _format_async_delegation(evt: dict) -> str:
         "have moved on since dispatching it; the full task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
         completed_at, with_goal=True)
+    if evt.get("completion_reply_expected"):
+        lines.append(
+            "This completes user-requested background work. Send the useful result to the user now; "
+            "do not return NO_REPLY and do not merely acknowledge completion."
+        )
     lines += _notice_lines([evt]) + [
         f"Status: {status}   API calls: {evt.get('api_calls', 0)}   Duration: {evt.get('duration_seconds', '?')}s"
         + (" [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""),
@@ -314,6 +324,38 @@ def _format_async_delegation(evt: dict) -> str:
         if summary:
             lines += ["Partial output:", summary]
     return "\n".join(lines)
+
+
+def delegation_user_fallback(evt: dict) -> str:
+    """Visible result when a required delegation completion incorrectly returns ``NO_REPLY``.
+
+    Keep this free of registry ids, transcript paths and other runtime diagnostics: it is sent
+    directly to the originating conversation and must read like the result, not an alert.
+    """
+    results = evt.get("results") if isinstance(evt.get("results"), list) else [evt]
+    display_tasks = evt.get("display_tasks") if isinstance(evt.get("display_tasks"), list) else []
+    if not display_tasks and evt.get("display_task"):
+        display_tasks = [evt.get("display_task")]
+    blocks: list[str] = []
+    multi = len(results) > 1
+    for position, result in enumerate(sorted(results, key=lambda item: item.get("task_index", 0))):
+        index = int(result.get("task_index", position) or 0)
+        label = str(display_tasks[index] if index < len(display_tasks) else "").strip()
+        summary = str(result.get("summary") or "").strip()
+        error = str(result.get("error") or "").strip()
+        status = str(result.get("status") or "").strip()
+        if summary:
+            body = summary
+        elif error:
+            body = f"Não consegui concluir esta parte: {error}"
+        else:
+            body = f"Esta parte terminou sem um resultado disponível{f' ({status})' if status else ''}."
+        if multi:
+            heading = label or f"Resultado {position + 1}"
+            blocks.append(f"*{heading}*\n{body}")
+        else:
+            blocks.append(body)
+    return "\n\n".join(blocks).strip() or "A tarefa em background terminou, mas não retornou um resultado utilizável."
 
 
 def async_delegation_display_text(evt: dict) -> str:

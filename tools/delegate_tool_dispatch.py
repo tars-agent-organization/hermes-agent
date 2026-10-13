@@ -50,6 +50,9 @@ class _Batch:
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
     live_home: Any = None  # explicit profile home for transcripts/manifest (#91996); None = ambient resolve
+    # Foreground/user-requested work owes the originating chat a visible result. Automatic
+    # self-improvement work may finish silently.
+    completion_reply_expected: bool = True
 
     def owner_kwargs(self) -> dict[str, Any]:
         """Steer/stop authority of the originating session, passed to every child run."""
@@ -408,6 +411,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
                           if i < len(unit.live_writers) and unit.live_writers[i] is not None
                           and unit.live_writers[i].path is not None},
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
+        completion_reply_expected=unit.completion_reply_expected,
     )
 
 def _restore_parent_cancellation(unit: _Batch) -> None:

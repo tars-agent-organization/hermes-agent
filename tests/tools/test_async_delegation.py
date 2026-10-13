@@ -174,6 +174,19 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_completion_event_preserves_required_reply_and_display_task():
+    res = ad.dispatch_async_delegation(
+        goal="find drills", context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:whatsapp:dm:123", display_task="Brocas para TV",
+        completion_reply_expected=True,
+        runner=lambda: {"status": "completed", "summary": "found"},
+    )
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt["completion_reply_expected"] is True
+    assert evt["display_task"] == "Brocas para TV"
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",

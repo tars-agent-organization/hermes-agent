@@ -588,10 +588,13 @@ def delegate_task(
     )
     if err:
         return tool_error(err)
+    from tools.skill_provenance import is_unattended_review
+
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
         live_home=_live_home,
+        completion_reply_expected=not is_unattended_review(),
     )
     return _run_batch(batch, background)
 

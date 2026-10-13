@@ -760,6 +760,35 @@ async def test_async_delegation_apiserver_persist_failure_is_retryable(
     assert result is False
 
 
+@pytest.mark.asyncio
+async def test_user_delegation_completion_requires_reply_and_carries_result_fallback(
+    monkeypatch, tmp_path,
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_required",
+        "session_key": "agent:main:telegram:dm:123",
+        "completion_reply_expected": True,
+        "display_tasks": ["Brocas para TV", "Ferramentas para instalação"],
+        "results": [
+            {"task_index": 0, "status": "completed", "summary": "Brocas encontradas."},
+            {"task_index": 1, "status": "completed", "summary": "Ferramentas encontradas."},
+        ],
+    }
+
+    assert await runner._inject_watch_notification("[BATCH COMPLETE]", evt) is True
+
+    injected = adapter.handle_message.await_args.args[0]
+    assert injected.reply_expected is True
+    assert injected.internal is True
+    assert injected.metadata["required_reply_fallback"] == (
+        "*Brocas para TV*\nBrocas encontradas.\n\n"
+        "*Ferramentas para instalação*\nFerramentas encontradas."
+    )
+
+
 def test_gateway_drain_retains_and_formats_overflow_events():
     """watch_overflow_* events must survive the gateway drain and render
     their summary — previously they were discarded at the drain (only

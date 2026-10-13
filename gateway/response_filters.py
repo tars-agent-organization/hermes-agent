@@ -125,6 +125,8 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
 
 def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
     """Whether a successful bare silence marker may remain silent for this turn."""
+    if reply_expected is True:
+        return False
     return is_machinery_display_kind(display_kind) or reply_expected is False
 
 

@@ -16,6 +16,8 @@ class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
     reply_expected: Optional[bool] = None
+    # User-facing delegation result used only if a required synthetic completion tries NO_REPLY.
+    required_reply_fallback: Optional[str] = None
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False

@@ -25,13 +25,14 @@ def _source():
     )
 
 
-def _event(*, internal: bool = False, reply_expected=None):
+def _event(*, internal: bool = False, reply_expected=None, metadata=None):
     return MessageEvent(
         text="side chatter",
         source=_source(),
         message_id="msg-42",
         internal=internal,
         reply_expected=reply_expected,
+        metadata=metadata or {},
     )
 
 
@@ -167,6 +168,27 @@ async def test_internal_silence_token_suppresses_delivery_but_preserves_transcri
 
 
 @pytest.mark.asyncio
+async def test_required_internal_completion_uses_real_result_fallback(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "NO_REPLY",
+        "messages": [{"role": "user", "content": "completion"},
+                     {"role": "assistant", "content": "NO_REPLY"}],
+        "tools": [], "history_offset": 0, "last_prompt_tokens": 0,
+        "api_calls": 1, "failed": False,
+    })
+    fallback = "*Brocas para TV*\nEncontrei duas opções disponíveis."
+
+    response = await runner._handle_message_with_agent(
+        _event(internal=True, reply_expected=True,
+               metadata={"required_reply_fallback": fallback}),
+        _source(), "agent:main:telegram:group:-1001:12345", 1,
+    )
+
+    assert response == fallback
+
+
+@pytest.mark.asyncio
 async def test_scheduled_heartbeat_silence_suppresses_delivery(monkeypatch, tmp_path):
     """A poller-stamped heartbeat turn may end on a bare marker (#113031); the event stays
     non-internal so authorization and the emergency stop still apply to it."""
@@ -213,6 +235,25 @@ async def test_queued_human_turn_also_gets_the_visible_fallback():
 
 
 @pytest.mark.asyncio
+async def test_queued_required_completion_uses_real_result_fallback():
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner._deliver_queued_first_response = AsyncMock(return_value=True)
+    fallback = "Encontrei as ferramentas e confirmei a entrega."
+    turn_ctx = SimpleNamespace(
+        session_key="agent:main:whatsapp:dm:123", stream_consumer_holder=[None],
+        mute_notification_reply=False, persist_user_display_kind="internal_notification",
+        reply_expected=True, required_reply_fallback=fallback, source=_source(),
+        _status_thread_metadata=None, event_message_id=None, inbound_message_id="msg-42",
+        run_generation=1,
+    )
+    result = {"final_response": "NO_REPLY", "failed": False}
+
+    await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
+
+    assert runner._deliver_queued_first_response.await_args.args[0] == fallback
+
+
+@pytest.mark.asyncio
 async def test_queued_terminal_turn_owns_the_silence_verdict(monkeypatch, tmp_path):
     """The chain's LAST turn decides whether a bare marker may vanish, not the opener."""
     runner = _runner(monkeypatch, tmp_path)
@@ -228,7 +269,8 @@ async def test_queued_terminal_turn_owns_the_silence_verdict(monkeypatch, tmp_pa
         run_generation=1, _interrupt_depth=0, history=[], _status_thread_metadata=None,
         context_prompt=None, result_holder=[None])
     pending_event = SimpleNamespace(source=_source(), message_id="43", channel_prompt=None,
-                                    message_type=None, internal=True, metadata={}, reply_expected=True)
+                                    message_type=None, internal=True,
+                                    metadata={"required_reply_fallback": "real result"}, reply_expected=True)
 
     merged = await gateway_run.GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=None, pending="hi again", pending_event=pending_event,
@@ -237,9 +279,11 @@ async def test_queued_terminal_turn_owns_the_silence_verdict(monkeypatch, tmp_pa
     followup = runner._run_agent.await_args.kwargs
     assert followup["persist_user_display_kind"] == "internal_notification"
     assert followup["reply_expected"] is True
+    assert followup["required_reply_fallback"] == "real result"
     assert followup["persist_user_display_metadata"]["reply_expected"] is True
     assert merged["queued_terminal_display_kind"] == "internal_notification"
     assert merged["queued_terminal_reply_expected"] is True
+    assert merged["queued_terminal_required_reply_fallback"] == "real result"
 
     def _result(terminal_kind, terminal_reply_expected=None):
         return {

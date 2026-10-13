@@ -1175,6 +1175,12 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
         try:
             metadata: dict[str, Any] = {"notification_origin": "process_registry_synthetic"}
+            required_completion_reply = bool(
+                evt.get("type") == "async_delegation" and evt.get("completion_reply_expected")
+            )
+            if required_completion_reply:
+                from tools.process_registry_notifications import delegation_user_fallback
+                metadata["required_reply_fallback"] = delegation_user_fallback(evt)
             synth_text = _mark_internal_notification(synth_text)
             session_key = str(evt.get("session_key") or "").strip()
             from agent.notification_presentation import diagnostic_process_event
@@ -1206,7 +1212,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 source = replace_source(source, message_id=None)
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
-                metadata=metadata,
+                metadata=metadata, reply_expected=True if required_completion_reply else None,
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
