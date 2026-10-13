@@ -135,9 +135,11 @@ def build_activity_snapshot(runner: Any, now: float | None = None) -> Dict[str, 
     for task in background_tasks:
         try:
             active = hasattr(task, "done") and not task.done()
+            permanent_watcher = getattr(task, "_hermes_supervised_watcher", False) is True
         except Exception:
             active = False
-        if active:
+            permanent_watcher = False
+        if active and not permanent_watcher:
             # Do not expose task names, coroutine reprs, or callback metadata.
             async_jobs.append({"category": "gateway task", "status": "running"})
 

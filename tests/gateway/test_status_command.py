@@ -503,6 +503,40 @@ async def test_agents_command_counts_local_agent_background_task_and_delegation_
 
 
 @pytest.mark.asyncio
+async def test_agents_command_hides_permanent_gateway_watchers(monkeypatch):
+    """Infrastructure loops keep the gateway healthy; they are not user-visible work."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+
+    permanent_watcher = MagicMock()
+    permanent_watcher.done.return_value = False
+    permanent_watcher._hermes_supervised_watcher = True
+    transient_job = MagicMock()
+    transient_job.done.return_value = False
+    transient_job._hermes_supervised_watcher = False
+    runner._background_tasks = {permanent_watcher, transient_job}
+
+    class _FakeRegistry:
+        def list_sessions(self):
+            return []
+
+    monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    monkeypatch.setattr("tools.async_delegation._records", {})
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert "**Gateway async jobs:** 1" in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_lists_live_delegated_workers_separately_and_excludes_completed(monkeypatch):
     """A canonical snapshot expands a live batch into workers, never async jobs."""
     session_entry = SessionEntry(
