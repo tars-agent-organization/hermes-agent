@@ -1,0 +1,3 @@
+# Kept separate from the gateway runtime because ctranslate2 does not yet ship
+# for every Python version supported by Hermes.
+faster-whisper==1.2.1
