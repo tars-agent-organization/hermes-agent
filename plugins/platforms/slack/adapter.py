@@ -4685,9 +4685,19 @@ class SlackAdapter(BasePlatformAdapter):
             reply_expected=self._slack_reply_expected(
                 routing_text, bot_uid, channel_id=channel_id, opens_own_session=thread_ts == ts,
                 addressed=is_one_to_one_dm or is_mentioned or is_command_text or force_process))
-        # React only when directly addressed; MPIMs are shared, so they need a
-        # mention like any channel.
-        if (is_one_to_one_dm or is_thread_reply or is_mentioned) and self._reactions_enabled():
+        # React when directly addressed. An explicit opt-in also acknowledges
+        # messages admitted by free-response channels, while passive capture
+        # traffic remains untouched because it never reaches this admitted path.
+        should_ack_free_message = (
+            self._slack_ack_free_response_messages()
+            and self._slack_is_free_channel(channel_id)
+        )
+        if (
+            is_one_to_one_dm
+            or is_thread_reply
+            or is_mentioned
+            or should_ack_free_message
+        ) and self._reactions_enabled():
             self._track_reacting_message(team_id, ts)
         # App-context is per-turn UI state: in the user message, not SessionSource (would rebuild
         # the agent per view switch and leak stale context). Inert label, never a channel body.
@@ -6395,13 +6405,16 @@ class SlackAdapter(BasePlatformAdapter):
     # Opt-in flags (``config.extra[key]`` else ``SLACK_*`` env). strict_mention: every thread
     # message needs an explicit @-mention (no auto-triggers); ignore_other_user_mentions: silent
     # when the *leading* token @-mentions someone else; thread_require_mention: thread replies
-    # need an @-mention even in free-response channels; disable_dms: incoming DMs are ignored.
+    # need an @-mention even in free-response channels; disable_dms: incoming DMs are ignored;
+    # ack_free_response_messages: react to admitted, unmentioned free-channel messages.
     _slack_strict_mention = _extra_or_env_flag_getter("strict_mention", "SLACK_STRICT_MENTION")
     _slack_ignore_other_user_mentions = _extra_or_env_flag_getter(
         "ignore_other_user_mentions", "SLACK_IGNORE_OTHER_USER_MENTIONS")
     _slack_thread_require_mention = _extra_or_env_flag_getter(
         "thread_require_mention", "SLACK_THREAD_REQUIRE_MENTION")
     _slack_disable_dms = _extra_or_env_flag_getter("disable_dms", "SLACK_DISABLE_DMS", strip=True)
+    _slack_ack_free_response_messages = _extra_or_env_flag_getter(
+        "ack_free_response_messages", "SLACK_ACK_FREE_RESPONSE_MESSAGES")
 
     def _slack_message_addressed_to_other_user(self, text: str, self_uids: set) -> bool:
         """True when the first token is a user mention (``<@U123>``/``<@U123|name>``)
@@ -6934,6 +6947,7 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("ignore_other_user_mentions", "SLACK_IGNORE_OTHER_USER_MENTIONS", "lower"),
     ("thread_require_mention", "SLACK_THREAD_REQUIRE_MENTION", "lower"), ("allow_bots", "SLACK_ALLOW_BOTS", "lower"),
     ("reactions", "SLACK_REACTIONS", "lower"), ("disable_dms", "SLACK_DISABLE_DMS", "lower"),
+    ("ack_free_response_messages", "SLACK_ACK_FREE_RESPONSE_MESSAGES", "lower"),
     ("free_response_channels", "SLACK_FREE_RESPONSE_CHANNELS", "csv"),
     ("require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS", "csv"),
     ("reaction_triggers", "SLACK_REACTION_TRIGGERS", "csv"), ("reaction_trigger_target", "SLACK_REACTION_TRIGGER_TARGET", "str"),

@@ -2703,6 +2703,41 @@ class TestReactions:
     """Test emoji reaction methods."""
 
 
+    @pytest.mark.asyncio
+    async def test_free_response_channel_message_is_tracked_when_ack_enabled(self, adapter):
+        """An admitted channel message can receive the immediate eyes acknowledgement."""
+        adapter.config.extra.update({
+            "free_response_channels": ["C_FREE"],
+            "ack_free_response_messages": True,
+        })
+
+        await adapter._handle_slack_message({
+            "text": "acompanha esse tema",
+            "user": "U_USER",
+            "channel": "C_FREE",
+            "channel_type": "channel",
+            "ts": "1234567890.000002",
+        })
+
+        assert "1234567890.000002" in adapter._reacting_message_ids
+
+
+    @pytest.mark.asyncio
+    async def test_free_response_channel_message_is_not_tracked_by_default(self, adapter):
+        """Passive/free-channel traffic stays reaction-free unless explicitly enabled."""
+        adapter.config.extra["free_response_channels"] = ["C_FREE"]
+
+        await adapter._handle_slack_message({
+            "text": "conversa ambiente",
+            "user": "U_USER",
+            "channel": "C_FREE",
+            "channel_type": "channel",
+            "ts": "1234567890.000003",
+        })
+
+        assert "1234567890.000003" not in adapter._reacting_message_ids
+
+
 
 
     @pytest.mark.asyncio
