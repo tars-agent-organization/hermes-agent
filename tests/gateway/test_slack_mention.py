@@ -290,6 +290,7 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
         "slack:\n"
         "  require_mention: false\n"
         "  ack_free_response_messages: true\n"
+        "  keep_ack_reaction: true\n"
         "  free_response_channels:\n"
         "    - C0AQWDLHY9M\n"
         "    - C9999999999\n",
@@ -299,6 +300,7 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
     monkeypatch.delenv("SLACK_ACK_FREE_RESPONSE_MESSAGES", raising=False)
+    monkeypatch.delenv("SLACK_KEEP_ACK_REACTION", raising=False)
     monkeypatch.delenv("SLACK_FREE_RESPONSE_CHANNELS", raising=False)
 
     config = load_gateway_config()
@@ -307,14 +309,17 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     slack_extra = config.platforms[Platform.SLACK].extra
     assert slack_extra.get("require_mention") is False
     assert slack_extra.get("ack_free_response_messages") is True
+    assert slack_extra.get("keep_ack_reaction") is True
     assert slack_extra.get("free_response_channels") == ["C0AQWDLHY9M", "C9999999999"]
     # Verify env vars were set by config bridging
     import os as _os
     assert _os.environ["SLACK_REQUIRE_MENTION"] == "false"
     assert _os.environ["SLACK_ACK_FREE_RESPONSE_MESSAGES"] == "true"
+    assert _os.environ["SLACK_KEEP_ACK_REACTION"] == "true"
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
     _os.environ.pop("SLACK_REQUIRE_MENTION", None)
     _os.environ.pop("SLACK_ACK_FREE_RESPONSE_MESSAGES", None)
+    _os.environ.pop("SLACK_KEEP_ACK_REACTION", None)
     _os.environ.pop("SLACK_FREE_RESPONSE_CHANNELS", None)
 
 

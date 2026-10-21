@@ -23,8 +23,9 @@ import pytest
 
 from agent import secret_scope
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import SessionSource
 from gateway.run import GatewayRunner
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 
 # ---------------------------------------------------------------------------
@@ -2701,6 +2702,37 @@ class TestEditMessageStreamingPipeline:
 
 class TestReactions:
     """Test emoji reaction methods."""
+
+
+    @pytest.mark.asyncio
+    async def test_keep_ack_reaction_preserves_eyes_after_completion(self, adapter):
+        """Configured acknowledgement eyes remain visible after a fast response completes."""
+        adapter.config.extra["keep_ack_reaction"] = True
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="D123",
+            chat_type="dm",
+            user_id="U_USER",
+        )
+        msg_event = MessageEvent(
+            text="Você tá bem?",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1234567890.000004",
+        )
+        adapter._track_reacting_message("", msg_event.message_id)
+
+        await adapter.on_processing_start(msg_event)
+        await adapter.on_processing_complete(msg_event, ProcessingOutcome.SUCCESS)
+
+        assert [call.kwargs["name"] for call in adapter._app.client.reactions_add.call_args_list] == [
+            "eyes",
+            "white_check_mark",
+        ]
+        adapter._app.client.reactions_remove.assert_not_awaited()
 
 
     @pytest.mark.asyncio
