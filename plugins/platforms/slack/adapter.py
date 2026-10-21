@@ -1574,6 +1574,37 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:  # pragma: no cover - diagnostics must never break connect
             pass
 
+    def _log_reaction_scope_status(self, auth_response, team_name: str) -> None:
+        """Report whether the installed app can write acknowledgement reactions."""
+        if not self._reactions_enabled():
+            return
+        try:
+            logged = self._lazy_attr("_reaction_scope_status_logged", set)
+            team_key = team_name or "this workspace"
+            if team_key in logged:
+                return
+            headers = getattr(auth_response, "headers", None) or {}
+            raw = headers.get("x-oauth-scopes") or headers.get("X-OAuth-Scopes") or ""
+            if not raw:
+                return
+            logged.add(team_key)
+            granted = {scope.strip() for scope in raw.split(",") if scope.strip()}
+            if "reactions:write" in granted:
+                logger.info(
+                    "[Slack] Reaction acknowledgements available in workspace %s "
+                    "(reactions:write granted)",
+                    team_key,
+                )
+            else:
+                logger.warning(
+                    "[Slack] Reaction acknowledgements will not work in workspace %s: "
+                    "the app is missing 'reactions:write'. Add the bot scope and REINSTALL "
+                    "the app to the workspace.",
+                    team_key,
+                )
+        except Exception:  # pragma: no cover - diagnostics must never break connect
+            pass
+
     def _warn_if_not_bot_token(self, auth_response, team_name: str) -> None:
         """Warn once per workspace when the token authenticates as a human: ``auth.test`` on an
         ``xoxp-`` token returns the installer's ``user_id`` and no ``bot_id``, so mentions OF THAT
@@ -1771,6 +1802,7 @@ class SlackAdapter(BasePlatformAdapter):
         logger.info(
             "[Slack] Authenticated as @%s in workspace %s (team: %s)", bot_name, team_name, team_id)
         self._warn_if_missing_group_dm_scopes(auth_response, team_name)
+        self._log_reaction_scope_status(auth_response, team_name)
         self._warn_if_not_bot_token(auth_response, team_name)
         self._warn_if_inchannel_without_flat_reply(team_name)
 
@@ -3287,7 +3319,7 @@ class SlackAdapter(BasePlatformAdapter):
             await self._react(channel_id, ts, "eyes", team_id, remove=False)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
+        """Add the final status and optionally preserve the acknowledgement eyes."""
         target = self._reacting_target(event)
         if target is None:
             return
@@ -3296,7 +3328,8 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._react(channel_id, ts, "eyes", team_id, remove=True)
+        if not self._slack_keep_ack_reaction():
+            await self._react(channel_id, ts, "eyes", team_id, remove=True)
         final = {ProcessingOutcome.SUCCESS: "white_check_mark", ProcessingOutcome.FAILURE: "x"}
         if outcome in final:
             await self._react(channel_id, ts, final[outcome], team_id, remove=False)
@@ -6415,6 +6448,8 @@ class SlackAdapter(BasePlatformAdapter):
     _slack_disable_dms = _extra_or_env_flag_getter("disable_dms", "SLACK_DISABLE_DMS", strip=True)
     _slack_ack_free_response_messages = _extra_or_env_flag_getter(
         "ack_free_response_messages", "SLACK_ACK_FREE_RESPONSE_MESSAGES")
+    _slack_keep_ack_reaction = _extra_or_env_flag_getter(
+        "keep_ack_reaction", "SLACK_KEEP_ACK_REACTION")
 
     def _slack_message_addressed_to_other_user(self, text: str, self_uids: set) -> bool:
         """True when the first token is a user mention (``<@U123>``/``<@U123|name>``)
@@ -6948,6 +6983,7 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("thread_require_mention", "SLACK_THREAD_REQUIRE_MENTION", "lower"), ("allow_bots", "SLACK_ALLOW_BOTS", "lower"),
     ("reactions", "SLACK_REACTIONS", "lower"), ("disable_dms", "SLACK_DISABLE_DMS", "lower"),
     ("ack_free_response_messages", "SLACK_ACK_FREE_RESPONSE_MESSAGES", "lower"),
+    ("keep_ack_reaction", "SLACK_KEEP_ACK_REACTION", "lower"),
     ("free_response_channels", "SLACK_FREE_RESPONSE_CHANNELS", "csv"),
     ("require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS", "csv"),
     ("reaction_triggers", "SLACK_REACTION_TRIGGERS", "csv"), ("reaction_trigger_target", "SLACK_REACTION_TRIGGER_TARGET", "str"),
