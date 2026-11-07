@@ -1182,7 +1182,8 @@ class GatewaySlashCommandsMixin(
         from tools.approval import has_blocking_approval
         session_key = self._session_key_for_source(event.source)
         if has_blocking_approval(session_key):
-            return session_key, None
+            from tools.approval_binding import bound_request_reply
+            return session_key, bound_request_reply(session_key)
         if session_key in self._pending_approvals:
             self._pending_approvals.pop(session_key)
             return session_key, t(stale_key)

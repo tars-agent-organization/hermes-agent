@@ -24,13 +24,15 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "cancelled", "data", "event", "reason", "result", "settle")
+    __slots__ = ("acknowledged", "cancelled", "data", "event", "expires_at", "reason", "result", "settle", "validate")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
+        self.expires_at = time.monotonic() + max(_ctx._get_approval_timeout(), 0)
+        self.validate = None
         # Surface hook run once when the wait ends by ANY path (answer, timeout, interrupt, /approve from
         # another client): the tui_gateway withdraws its open server→client request through it.
         self.settle = None
@@ -220,6 +222,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             entry.cancelled = cancelled
             entry.event.set()
         choice = _drop_entry(state)
+        from tools.approval_binding import valid
+        if choice not in (None, "deny") and not valid(entry):
+            choice = None
+            cancelled = "authorization or approval validity changed while waiting"
         if state == "interrupted":
             # Our own decision stays a fail-closed deny.
             choice = "deny"

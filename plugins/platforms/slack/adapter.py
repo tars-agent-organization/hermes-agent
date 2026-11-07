@@ -1074,6 +1074,7 @@ class SlackAdapter(BasePlatformAdapter):
         # approval / clarify message_ts (or (team_id, ts)) → resolved; blocks double-clicks.
         # Bounded: never-clicked prompts would otherwise leak forever.
         self._approval_resolved: dict[Any, bool] = {}
+        self._approval_bindings: dict[Any, dict] = {}
         self._clarify_resolved: dict[Any, bool] = {}
         # clarify_id → (channel_id, message_ts, rendered_question) so the gateway can retire a
         # card whose clarify ended without a click (timeout, reset, superseding prose).
@@ -5029,21 +5030,8 @@ class SlackAdapter(BasePlatformAdapter):
         return max(0, self._EA_SECTION_CAP - fixed)
 
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
-        """Block Kit approval prompt; the buttons call ``resolve_gateway_approval()`` to unblock the
-        waiting agent thread — same mechanism as the text ``/approve`` flow."""
-
-        def _build() -> tuple[str, list]:
-            actions = [
-                self._button(label, self._EA_ACTION_IDS[choice], prompt.session_key, style=style)
-                for label, choice, style in prompt.actions]
-            blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": prompt.text}},
-                {"type": "actions", "elements": actions}]
-            return t("platform.slack.approval.fallback_text", command=prompt.command[:100]), blocks
-
-        return await self._send_interactive_prompt(
-            prompt.chat_id, prompt.metadata, _build, "send_exec_approval",
-            resolved=self._approval_resolved, resolved_max=self._APPROVAL_RESOLVED_MAX)
+        from .approval_binding import send_prompt
+        return await send_prompt(self, prompt)
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
@@ -5681,6 +5669,9 @@ class SlackAdapter(BasePlatformAdapter):
             return
         team_id, action_id, session_key, message, msg_ts, channel_id, user_name, _user_id = started
         choice = self._APPROVAL_CHOICES.get(action_id, "deny")
+        from .approval_binding import handle_bound_action
+        if await handle_bound_action(self, started, choice):
+            return
         # Double-click guard (atomic pop). Also accept the bare ts: the approval may
         # have been stored without a team id while the click carries one.
         approval_key = self._workspace_message_marker(team_id, msg_ts)

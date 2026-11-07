@@ -139,7 +139,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None,
+                             origin: Optional[dict] = None) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
@@ -149,6 +150,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
+            return 0
+        from tools.approval_binding import valid
+        # Bound requests are single-operation, never FIFO/session/all grants. Only a
+        # transport-verified origin and the exact delivered request can resolve one.
+        candidates = [e for e in queue if not request_id or e.data.get("request_id") == request_id]
+        if any((e.data.get("requires_binding") or e.data.get("approval_origin") is not None) and
+               (not request_id or resolve_all or choice not in {"once", "deny"}
+                or not valid(e, origin=origin, resolving=True)) for e in candidates):
             return 0
         if request_id:
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
@@ -547,6 +556,10 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
     ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
+    from tools.approval_handoff import handoff_if_detached
+    handoff = handoff_if_detached(command, description, pattern_keys, session_key, unavailable=True)
+    if handoff is not None:
+        return handoff
     pending = {"command": command, "pattern_key": pattern_key}
     if spec.pending_keys:
         pending["pattern_keys"] = pattern_keys
@@ -770,6 +783,17 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     }, True
 
 
+def _before_human_decision(spec, command, description, pattern_key, pattern_keys, session_key, smart, human_present):
+    smart_denied = False
+    if smart:
+        result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
+                                         session_key, human_present=human_present)
+        if result is not None:
+            return result, smart_denied
+    from tools.approval_handoff import handoff_if_detached
+    return handoff_if_detached(command, description, pattern_keys, session_key), smart_denied
+
+
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
@@ -782,12 +806,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     """
     from agent.redact import redact_sensitive_text
 
-    smart_denied = False
-    if smart:
-        result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
-                                           session_key, human_present=is_cli or is_gateway or is_ask)
-        if result is not None:
-            return result
+    result, smart_denied = _before_human_decision(
+        spec, command, description, pattern_key, pattern_keys, session_key, smart, is_cli or is_gateway or is_ask)
+    if result is not None:
+        return result
     pending_body = pending_body() if pending_body else None
     allow_permanent = not smart_denied
 
@@ -843,6 +865,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             }
             if smart_denied:
                 data["smart_denied"] = True
+            from tools.approval_handoff import owner_id, current_execution_scope
+            if owner_id():
+                data.update(requires_binding=True, allow_session=False, allow_permanent=False)
+                data["execution_scope"] = current_execution_scope()
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
@@ -1163,12 +1189,18 @@ def check_all_command_guards(command: str, env_type: str,
     session_key = get_current_session_key()
     if not is_dangerous or is_approved(session_key, pattern_key):
         return _approved()
-    return _human_decision(
+    result = _human_decision(
         _COMMAND_GATE, command=command, description=description,
         pattern_key=pattern_key, pattern_keys=[pattern_key],
         session_key=session_key, approval_callback=approval_callback,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
     )
+    from tools.approval_handoff import owner_id
+    if result.get("user_approved") and owner_id():
+        # An operator may have revoked this command while the card was open.
+        # Recheck vetoes without spending another approval or resetting counters.
+        return _floor_block(command, sudo_guard=True) or result
+    return result
 
 
 _EXECUTE_CODE_DESCRIPTION = (

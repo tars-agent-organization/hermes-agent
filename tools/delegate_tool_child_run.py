@@ -646,7 +646,8 @@ def _build_result_entry(
         entry["missed_steer"] = _missed_steer
         _miss_note = ("[steer did not land — the subagent finished before it could " f"be delivered: {_missed_steer}]")
         entry["summary"] = f"{summary}\n\n{_miss_note}" if summary else _miss_note
-    return entry
+    from tools.approval_handoff import attach_handoffs
+    return attach_handoffs(entry, result)
 
 
 def _is_image_url(ref: str) -> bool:
@@ -855,10 +856,14 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
+            from tools.approval_handoff import collect_handoffs
+            with delegated_child_context(str(getattr(child, "session_id", "") or "")), collect_handoffs() as handoffs:
+                result = child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
+                if handoffs:
+                    result["approval_handoffs"] = handoffs
+                return result
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
