@@ -196,6 +196,31 @@ approvals:
   timeout: 300  # seconds (default: 300)
 ```
 
+### Owner-bound Slack approvals for delegated work (opt-in)
+
+On a Slack-only profile, `approvals.slack_owner_id: "U_AUTHENTICATED_OWNER_ID"`
+restricts native command consent to that existing authorized Slack principal.
+This is not an allowlist and grants no new access. Other profiles remain unchanged.
+The originating workspace, channel and thread must match the authenticated source;
+missing origin information fails closed rather than inventing an owner context.
+
+In this mode, delegated children return an `approval_handoff`, including command
+fingerprint, execution scope and tool-call evidence. They do not create pending
+approvals and never execute the blocked operation. The parent receives these records
+independently of the child's prose. It must verify the original request and exact
+arguments, validity, resource/budget constraints, counters and idempotency before a
+fresh native foreground tool call. The handoff itself is not consent, a retry permit,
+or a durable executable queue. Redacted command previews must not be replayed.
+
+The native Slack card offers only once/deny. It binds one request to one owner and
+one thread; typed FIFO approvals, session/always and approve-all do not resolve it.
+Delivery must be confirmed; failure or ambiguous delivery withdraws the request.
+Old, duplicated or evicted cards cannot authorize another request. Identity policy
+and approval validity are checked on resolution and again before the waiter resumes.
+The normal tool and application guards still apply: this mechanism does not extend
+an application authorization or budget, reset counters, or replace domain-specific
+checks inside scripts. No automatic replay is performed after denial or timeout.
+
 ### What Triggers Approval
 
 The following patterns trigger approval prompts (defined in `tools/approval.py`):

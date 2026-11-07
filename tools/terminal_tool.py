@@ -1023,6 +1023,9 @@ def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *,
         return _ApprovalVerdict(approved_run=True)
     approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
     if not approval["approved"]:
+        if approval.get("status") == "approval_handoff":
+            raise _Rejected(_error_json(approval["message"], status="approval_handoff",
+                                        approval_pending=False, handoff=approval["handoff"]))
         if approval.get("status") == "pending_approval":  # gateway ask mode
             raise _Rejected(_error_json(
                 "", status="pending_approval",
@@ -1448,7 +1451,9 @@ def terminal_tool(
             ))
         # Pre-exec security checks (floors + dangerous command detection);
         # force=True means the user already confirmed.
-        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+        from tools.approval_handoff import execution_scope
+        with execution_scope(plan, workdir=workdir, background=background, pty=pty):
+            verdict = _run_approval_guards(command, env_type, plan.config, force=force)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if plan.promoted_from_foreground_timeout is not None:
