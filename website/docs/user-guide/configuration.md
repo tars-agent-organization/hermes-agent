@@ -1219,6 +1219,7 @@ agent:
                                # "unlimited"/"inf"/"infinity"/"infinite"/0/-1 = no limit
   budget_warning_ratio: null   # Optional one-time checkpoint warning, e.g. 0.75
   api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
+  codex_request_compression: true  # Set false for plain JSON on the official Codex endpoint
   auto_recovery_cycles: 5      # Wait-and-retry cycles after retries + fallback are spent on an outage (0 = off)
 ```
 
@@ -1231,6 +1232,20 @@ agent:
 A rate limit that names its reset (`Retry-After` or a `retry_after` body field) is waited out, capped at 600 s per retry. The live status line shows the wait and, when the provider names it, when the limit resets. One exception: on the free Nous tier (no sign-in), a session someone is watching (the Desktop app, the TUI, the `hermes` terminal chat, an ACP editor) does not sit through a cooldown longer than 60 s, because the free tier's pause covers the whole service and a retry before the reset only meets the same refusal. The turn ends at once and says when the limit lifts; a configured fallback runs first. Unattended runs (`hermes chat -q`, cron, messaging platforms, delegated subagents) keep waiting.
 
 `agent.auto_recovery_cycles` is the safety net *after* both the retries and the fallback chain are spent. When the failure is a transient outage (HTTP 5xx, an `overloaded`/529 response, a connect or read timeout) and no answer text has reached you yet, Hermes does not end the turn with "API failed after N retries" — it waits and tries again, up to this many cycles (default `5`), with a jittered 15/30/60/60/60 s schedule. A provider `Retry-After` header wins over the schedule (honoured up to 120 s). Every surface shows the same line while it waits — `⏳ Provider temporarily unavailable — retrying automatically in 30s (cycle 2/5); press Esc to stop` on the CLI/TUI/Desktop, a status bubble on messaging platforms (`send /stop to cancel`), a `hermes.status` SSE event on the API server, and a log line for cron jobs. Pressing Esc (or `/stop`) cancels the wait immediately. Fallback still comes first: with a fallback chain configured, exhaustion moves to the next provider as before, and the ladder only engages once the chain has nothing left. Authentication, billing, request-format, entitlement, content-policy and account-policy errors never enter the ladder. Set `0` to disable it.
+
+### Codex request compression
+
+`agent.codex_request_compression: false` disables zstd request encoding for the
+official ChatGPT Codex endpoint in the current profile. Some valid compressed
+bodies receive an opaque HTTP 400 from that endpoint
+([upstream issue #148898](https://github.com/NousResearch/hermes-agent/issues/148898)).
+The JSON payload, conversation history, model, credentials and tool authorization
+stay unchanged. This setting adds no retries or fallback model. Other destinations
+are unaffected; profiles without the setting retain the existing default (`true`).
+
+The setting is read when a client is created. Restart the owning gateway after
+changing it so cached clients use the new encoding. An HTTP 400 alone does not
+prove a compression problem; validate the affected conversation after activation.
 
 ## Wall-Clock Run Budget
 
