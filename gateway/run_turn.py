@@ -3949,8 +3949,8 @@ class GatewayTurnMixin:
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
-
-            followup_result = await self._run_agent(
+            from gateway.run_turn_followup_context import run_queued_request
+            followup_result = await run_queued_request(self, pending_event,
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
