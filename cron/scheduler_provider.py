@@ -92,6 +92,12 @@ def _existing_profile_homes(profile_homes: list) -> list:
     return [entry for entry in profile_homes if Path(_profile_entry(entry)[1]).is_dir()]
 
 
+def _gated_profile_homes(profile_homes, profile_gate):
+    """Use the same ownership decision for startup recovery and ordinary ticks."""
+    homes = [_profile_entry(e) for e in _existing_profile_homes(profile_homes)]
+    return homes if profile_gate is None else [(name, home) for name, home in homes if profile_gate(name, home)]
+
+
 def routed_profile_fire(home=None) -> bool:
     """True when a fire runs for a profile OTHER than the process's own.
 
@@ -546,7 +552,13 @@ class InProcessCronScheduler(CronScheduler):
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
 
-        initial_homes = _existing_profile_homes(profile_homes)
+        try:
+            initial_homes = _gated_profile_homes(profile_homes, profile_gate)
+        except BaseException as exc:
+            # Unknown ownership must not recover another gateway's work or stamp its heartbeat.
+            # The guarded cycle below retries enumeration without killing the ticker thread.
+            logger.error("Cron startup profile enumeration error: %s", exc, exc_info=True)
+            initial_homes = []
         register_ticked_homes([_profile_entry(entry)[1] for entry in initial_homes])
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s%s",
@@ -600,10 +612,7 @@ class InProcessCronScheduler(CronScheduler):
             # tick the ungated set — the exact stand-down the Desktop gate exists for (#100489).
             cycle_homes: list = []
             try:
-                enumerated = [_profile_entry(e) for e in _existing_profile_homes(profile_homes)]
-                if profile_gate is not None:
-                    enumerated = [(name, home) for name, home in enumerated if profile_gate(name, home)]
-                cycle_homes = enumerated
+                cycle_homes = _gated_profile_homes(profile_homes, profile_gate)
                 # Republish the owned set BEFORE any tick: the per-profile yield gate asks
                 # "do I own cron for this home?" and a profile added or gated out this cycle
                 # must be reflected in that answer, not one cycle late.

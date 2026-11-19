@@ -470,14 +470,13 @@ def _get_scope_lock_path(scope: str, identity: str) -> Path:
 def _get_process_start_time(pid: int) -> Optional[int]:
     """Return a stable per-process start-time fingerprint, or None.
 
-    Used as a PID-reuse guard: a ``(pid, start_time)`` pair uniquely identifies
-    a process, so a recycled PID (same number, different process) yields a
-    different value and is never mistaken for the original.
+    Used as a PID-reuse guard: ``(pid, start_time)`` identifies one incarnation;
+    a recycled PID (same number, different process) must yield a different value.
 
     On Linux this is field 22 of ``/proc/<pid>/stat`` (start time in clock
     ticks since boot, an int).  On platforms without ``/proc`` (macOS, Windows)
-    we fall back to ``psutil.Process(pid).create_time()`` — a float epoch
-    timestamp — quantized to an int (centiseconds) for stable equality.
+    we use psutil's process identity, quantized to centiseconds. On macOS its
+    monotonic identity avoids the wall-clock correction applied by create_time().
 
     The two sources are never mixed on a single platform: ``/proc`` always
     succeeds first on Linux, and always fails on macOS/Windows so psutil is
@@ -492,12 +491,13 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         pass
 
-    # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
-    # cross-platform creation time.  Quantize to centiseconds so repeated reads
-    # of the same process compare equal without float-precision fragility.
+    # psutil is pinned: its macOS _ident uses the kernel's unadjusted start time,
+    # unlike create_time(), whose clock correction varies by observer lifetime.
+    # Keep Windows' epoch contract; strict SCM identity validation relies on it.
     try:
         import psutil  # type: ignore
-        return round(psutil.Process(pid).create_time() * 100)
+        process = psutil.Process(pid)
+        return round((process._ident[1] if sys.platform == "darwin" else process.create_time()) * 100)
     except Exception:
         return None
 
