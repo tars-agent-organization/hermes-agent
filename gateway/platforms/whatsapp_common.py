@@ -175,7 +175,7 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
             return None
         return lease
 
-    def _message_closes_conversation(self, data: Dict[str, Any]) -> bool:
+    def _message_closes_conversation(self, data: dict[str, Any]) -> bool:
         body = str(data.get("body") or "")
         return any(pattern.search(body) for pattern in self._conversation_close_patterns())
 

@@ -431,7 +431,7 @@ async def test_agents_command_aggregates_delegations_from_other_profile_without_
             return []
 
     monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
-    import tools.async_delegation as async_delegation
+    from tools import async_delegation
 
     monkeypatch.setattr(
         async_delegation,
@@ -478,7 +478,7 @@ async def test_agents_command_counts_local_agent_background_task_and_delegation_
             return []
 
     monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
-    import tools.async_delegation as async_delegation
+    from tools import async_delegation
 
     monkeypatch.setattr(
         async_delegation,
@@ -561,7 +561,7 @@ async def test_agents_command_lists_live_delegated_workers_separately_and_exclud
             }]
 
     monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
-    import tools.async_delegation as async_delegation
+    from tools import async_delegation
 
     now = time.time()
     monkeypatch.setattr(
@@ -625,7 +625,7 @@ async def test_agents_command_projects_only_public_metadata_for_live_single_batc
             return []
 
     monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
-    import tools.async_delegation as async_delegation
+    from tools import async_delegation
 
     raw_secret = "token=private-token https://secret.example /private/path jane@example.com +1 555 555 5555"
     monkeypatch.setattr(async_delegation, "_records", {
@@ -683,7 +683,7 @@ async def test_agents_command_falls_back_for_adversarial_public_metadata(monkeyp
     monkeypatch.setattr(
         "tools.process_registry.process_registry", type("Registry", (), {"list_sessions": lambda _self: []})()
     )
-    import tools.async_delegation as async_delegation
+    from tools import async_delegation
 
     goal = "Review private deployment credentials before production release"
     monkeypatch.setattr(async_delegation, "_records", {
@@ -720,7 +720,7 @@ async def test_agents_command_keeps_safe_public_siblings_and_hides_rejected_fiel
     monkeypatch.setattr(
         "tools.process_registry.process_registry", type("Registry", (), {"list_sessions": lambda _self: []})()
     )
-    import tools.async_delegation as async_delegation
+    from tools import async_delegation
 
     copied_task = "Revisar credenciais privadas"
     monkeypatch.setattr(async_delegation, "_records", {

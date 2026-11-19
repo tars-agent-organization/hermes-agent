@@ -285,7 +285,7 @@ def encrypted_speech_envelope(
     nonce = nonce or os.urandom(12)
     if len(key) != 32 or len(nonce) != 12:
         raise ValueError("invalid_speech_encryption_key")
-    aad = f"tars-apns-speech:v1:{event}:{run_id}".encode("utf-8")
+    aad = f"tars-apns-speech:v1:{event}:{run_id}".encode()
     ciphertext = AESGCM(key).encrypt(
         nonce,
         _spoken_summary(text).encode("utf-8"),

@@ -40,7 +40,7 @@ class ForegroundBudgetGuard:
 
     def __init__(
         self,
-        budget_seconds: float | int,
+        budget_seconds: float,
         *,
         strict_background_handoff: bool = False,
         background_delegation_disabled: bool = False,

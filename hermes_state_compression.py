@@ -773,7 +773,7 @@ class SessionCompressionMixin:
 
     def claim_context_thresholds(
         self, logical_session_id: str, *, prompt_tokens: int, effective_context_length: int,
-    ) -> List[int]:
+    ) -> list[int]:
         """Atomically claim newly crossed 25/50/75 percent thresholds."""
         if not logical_session_id or prompt_tokens <= 0 or effective_context_length <= 0:
             return []
@@ -809,7 +809,7 @@ class SessionCompressionMixin:
 
         return self._execute_write(_do)
 
-    def get_context_occupancy_state(self, logical_session_id: str) -> Dict[str, Any]:
+    def get_context_occupancy_state(self, logical_session_id: str) -> dict[str, Any]:
         row = self._read_one(
             "SELECT * FROM context_occupancy_alerts WHERE logical_session_id = ?",
             (logical_session_id,),

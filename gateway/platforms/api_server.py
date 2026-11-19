@@ -2538,7 +2538,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             key_path = str(_get_scoped_secret("APNS_AUTH_KEY_PATH", "") or "").strip()
             if key_path:
                 try:
-                    key = Path(key_path).expanduser().read_text(encoding="utf-8")
+                    key = Path(key_path).expanduser().read_text(encoding="utf-8-sig")
                 except OSError:
                     key = ""
         return APNSSettings(

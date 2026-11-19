@@ -49,6 +49,29 @@ def _settings() -> APNSSettings:
     )
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_apns_key_file_accepts_utf8_with_or_without_bom(tmp_path, monkeypatch, encoding):
+    from gateway.platforms import api_server
+
+    pem = _private_key_pem()
+    key_path = tmp_path / "synthetic.p8"
+    key_path.write_text(pem, encoding=encoding)
+    monkeypatch.setattr(
+        api_server,
+        "_get_scoped_secret",
+        lambda name, default=None: str(key_path) if name == "APNS_AUTH_KEY_PATH" else default,
+    )
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+
+    settings = adapter._apns_settings()
+
+    assert settings.auth_key == pem
+    assert isinstance(
+        serialization.load_pem_private_key(settings.auth_key.encode(), password=None),
+        ec.EllipticCurvePrivateKey,
+    )
+
+
 class _FakeResponse:
     def __init__(self, status_code=200, body=None, headers=None):
         self.status_code = status_code

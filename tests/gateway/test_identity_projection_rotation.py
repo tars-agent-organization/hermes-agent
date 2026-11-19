@@ -125,7 +125,7 @@ async def test_changed_grant_rotates_before_model_commits_after_detach_and_keeps
         seen["tool_calls"] = ["contact_memory_lookup"]
         return "Consulta atualizada."
 
-    runner._handle_message_with_agent = pre_model  # noqa: SLF001
+    runner._handle_message_with_agent = pre_model
     assert await runner._handle_message(_event("e a Maju?")) == "Precisa esclarecer a qual Maju você se refere."
 
     assert seen["detached_before_model"] is True
@@ -173,7 +173,7 @@ async def test_pending_revision_is_not_committed_or_dispatched_when_detach_fails
     # Exercise the real partial-detach path: the canonical row is ended, but
     # the active routing mirror cannot be durably removed, so dispatch stops.
     monkeypatch.setattr(store, "_save", fail_routing_persist)
-    runner._handle_message_with_agent = AsyncMock(return_value="must not run")  # noqa: SLF001
+    runner._handle_message_with_agent = AsyncMock(return_value="must not run")
 
     assert await runner._handle_message(_event("consulta")) is None
     assert state == {"pending": True, "commits": 0}

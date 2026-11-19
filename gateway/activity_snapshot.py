@@ -55,8 +55,8 @@ def _elapsed(now: float, started_at: Any) -> int:
         return 0
 
 
-def _snapshot_delegated_agents(records: Iterable[Dict[str, Any]], now: float) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def _snapshot_delegated_agents(records: Iterable[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
     for record_index, record in enumerate(records):
         if not isinstance(record, dict) or record.get("status") not in _ACTIVE_DELEGATION_STATES:
@@ -94,8 +94,8 @@ def _snapshot_delegated_agents(records: Iterable[Dict[str, Any]], now: float) ->
     return sorted(rows, key=lambda row: (-row["elapsed_seconds"], row["display_name"], row["child_index"]))
 
 
-def _snapshot_processes(processes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def _snapshot_processes(processes: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for process in processes:
         if not isinstance(process, dict) or process.get("status") != "running":
@@ -112,7 +112,7 @@ def _snapshot_processes(processes: Iterable[Dict[str, Any]]) -> List[Dict[str, A
     return sorted(rows, key=lambda row: (-row["elapsed_seconds"], row["handle"]))
 
 
-def build_activity_snapshot(runner: Any, now: float | None = None) -> Dict[str, List[Dict[str, Any]]]:
+def build_activity_snapshot(runner: Any, now: float | None = None) -> dict[str, list[dict[str, Any]]]:
     """Take one canonical, best-effort snapshot without leaking registry payloads."""
     from tools.async_delegation import list_async_delegations
     from tools.process_registry import process_registry
